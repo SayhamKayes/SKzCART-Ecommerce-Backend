@@ -1,0 +1,33 @@
+from django.urls import path
+from . import views
+
+urlpatterns = [
+    path('products/bulk-upload-csv', views.bulk_upload_csv, name='bulk_upload_csv'),
+    path('products/bulk-upload-csv/', views.bulk_upload_csv, name='bulk_upload_csv_slash'),
+    path('products/bulk-delete', views.bulk_delete_products, name='bulk_delete_products'),
+    path('products/bulk-delete/', views.bulk_delete_products, name='bulk_delete_products_slash'),
+    path('products/bulk-stock', views.bulk_update_stock, name='bulk_update_stock'),
+    path('products/reorder', views.reorder_products, name='reorder_products'),
+    path('products', views.products_list_create, name='products_list_create'),
+    path('products/', views.products_list_create, name='products_list_create_slash'),
+    path('products/<str:pk>', views.product_detail_update, name='product_detail_update'),
+    path('products/<str:pk>/', views.product_detail_update, name='product_detail_update_slash'),
+    path('upload/image', views.upload_image_view, name='upload_image'),
+    path('upload/image/', views.upload_image_view, name='upload_image_slash'),
+    path('upload/image/delete', views.delete_image_view, name='delete_image'),
+    path('upload/image/delete/', views.delete_image_view, name='delete_image_slash'),
+    path('media/sync', views.sync_media_library_view, name='sync_media_library'),
+    path('media/sync/', views.sync_media_library_view, name='sync_media_library_slash'),
+    path('media', views.media_list_or_upload, name='media_list_or_upload'),
+    path('media/', views.media_list_or_upload, name='media_list_or_upload_slash'),
+    path('media/<str:pk>', views.media_detail_update_delete, name='media_detail_update_delete'),
+    path('media/<str:pk>/', views.media_detail_update_delete, name='media_detail_update_delete_slash'),
+    path('coupons', views.coupons_list_or_create, name='coupons_list_or_create'),
+    path('coupons/', views.coupons_list_or_create, name='coupons_list_or_create_slash'),
+    path('coupons/<str:code>', views.coupon_detail_update_delete, name='coupon_detail_update_delete'),
+    path('coupons/<str:code>/', views.coupon_detail_update_delete, name='coupon_detail_update_delete_slash'),
+    path('reviews', views.reviews_list_create, name='reviews_list_create'),
+    path('reviews/', views.reviews_list_create, name='reviews_list_create_slash'),
+    path('reviews/<str:pk>', views.review_detail_update_delete, name='review_detail_update_delete'),
+    path('reviews/<str:pk>/', views.review_detail_update_delete, name='review_detail_update_delete_slash'),
+]
