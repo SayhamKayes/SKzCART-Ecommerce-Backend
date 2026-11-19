@@ -1,6 +1,6 @@
 <div align="center">
 
-# ⚙️ SketchGuard — Backend API Engine
+# ⚙️ SKzCART | Backend API Engine
 ### **Django REST Core, Neon PostgreSQL Persistence, Payment Gateways & Courier Hub**
 
 [![Django](https://img.shields.io/badge/Django_5.2-092E20?style=for-the-badge&logo=django&logoColor=white)](https://www.djangoproject.com/)
