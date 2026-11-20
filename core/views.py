@@ -4,6 +4,7 @@ from rest_framework.response import Response
 from rest_framework import status
 from django.http import HttpResponse
 from django.utils import timezone
+import os
 import time
 import uuid
 
@@ -335,9 +336,9 @@ def marketing_config_view(request):
     if not config:
         config = MarketingConfig.objects.create(
             id='default_config',
-            pixelId='184729481920384',
+            pixelId='',
             capiToken='',
-            ga4Id='G-881920BD',
+            ga4Id='',
             testEventCode='',
             targetScope='GLOBAL',
             targetProductId='',
@@ -385,11 +386,18 @@ def marketing_capi_event_view(request):
     user_data = data.get('userData', {})
     custom_data = data.get('customData', {})
     value = custom_data.get('value')
-    order_id = custom_data.get('orderId')
+    order_id = custom_data.get('orderId') or custom_data.get('order_id') or data.get('orderId')
     source = data.get('source', 'website')
     campaign = data.get('campaign', '')
 
     config = MarketingConfig.objects.first()
+    if config and not config.isActive:
+        return Response({
+            'success': False,
+            'paused': True,
+            'message': 'Meta Pixel & CAPI tracking is currently paused.'
+        })
+
     capi_result = None
 
     client_ip = request.META.get('HTTP_X_FORWARDED_FOR', request.META.get('REMOTE_ADDR', '127.0.0.1'))
@@ -399,9 +407,20 @@ def marketing_capi_event_view(request):
 
     meta_pixel_id = (config.pixelId if config and config.pixelId else '') or os.getenv('META_PIXEL_ID', '')
     meta_capi_token = (config.capiToken if config and config.capiToken else '') or os.getenv('META_CAPI_TOKEN', '')
-    is_active = (config.isActive if config else True) and bool(meta_pixel_id and meta_capi_token)
+    is_capi_enabled = bool(meta_pixel_id and meta_capi_token)
 
-    if is_active:
+    capi_custom_data = {
+        'currency': custom_data.get('currency') or 'BDT',
+        'value': float(value or 0) if value is not None else 0,
+    }
+    if custom_data.get('content_name'):
+        capi_custom_data['content_name'] = custom_data['content_name']
+    if custom_data.get('content_ids'):
+        capi_custom_data['content_ids'] = custom_data['content_ids']
+    if order_id:
+        capi_custom_data['order_id'] = str(order_id)
+
+    if is_capi_enabled:
         test_code = data.get('testEventCode') or (config.testEventCode if config else '') or os.getenv('META_TEST_EVENT_CODE', '')
         capi_result = send_meta_capi_event(
             pixel_id=meta_pixel_id,
@@ -415,30 +434,74 @@ def marketing_capi_event_view(request):
             fbc=user_data.get('fbc', ''),
             email=user_data.get('em', ''),
             phone=user_data.get('ph', ''),
-            custom_data=custom_data,
+            custom_data=capi_custom_data,
             test_event_code=test_code
         )
 
     now_str = timezone.localtime().isoformat()
+    items_list = custom_data.get('items') if isinstance(custom_data.get('items'), list) else data.get('items')
     product_name = custom_data.get('content_name') or data.get('productName') or data.get('name') or ''
     content_ids = custom_data.get('content_ids')
     product_id = content_ids[0] if isinstance(content_ids, list) and content_ids else data.get('productId', '')
 
-    mkt_event = MarketingEvent.objects.create(
-        id=f"mkt-{uuid.uuid4().hex[:8]}",
-        eventId=event_id,
-        eventName=event_name,
-        timestamp=now_str,
-        browserReported=data.get('browserReported', True),
-        serverCapiReported=True,
-        source=source,
-        campaign=campaign,
-        value=value if value is not None else 0,
-        orderId=order_id,
-        productName=str(product_name),
-        productId=str(product_id) if product_id else '',
-        dedupMatched=True
-    )
+    # Deduplicate Purchase events by orderId so identical orders are never recorded twice
+    if event_name == 'Purchase' and order_id:
+        existing_purchase = MarketingEvent.objects.filter(orderId=str(order_id), eventName='Purchase').first()
+        if existing_purchase:
+            return Response({
+                'success': True,
+                'deduplicated': True,
+                'event_id': existing_purchase.eventId,
+                'capi_result': capi_result,
+                'event': MarketingEventSerializer(existing_purchase).data
+            })
+
+    # Store item-level breakdown when products are included in Cart/Purchase events
+    if isinstance(items_list, list) and len(items_list) >= 1 and event_name in ('Purchase', 'InitiateCheckout'):
+        created_events = []
+        for idx, item in enumerate(items_list):
+            if not isinstance(item, dict):
+                continue
+            item_pid = str(item.get('productId') or item.get('id') or product_id or '')
+            item_pname = str(item.get('name') or product_name or '')
+            item_qty = int(item.get('quantity') or 1)
+            item_val = float(item.get('price') or 0) * item_qty
+            ev = MarketingEvent.objects.create(
+                id=f"mkt-{uuid.uuid4().hex[:8]}",
+                eventId=f"{event_id}_{idx}" if idx > 0 else event_id,
+                eventName=event_name,
+                timestamp=now_str,
+                browserReported=data.get('browserReported', True),
+                serverCapiReported=True,
+                source=source,
+                campaign=campaign,
+                value=item_val if item_val > 0 else (value if idx == 0 and value is not None else 0),
+                orderId=order_id,
+                productName=item_pname[:255],
+                productId=item_pid[:100],
+                dedupMatched=True
+            )
+            created_events.append(ev)
+        mkt_event = created_events[0] if created_events else None
+    else:
+        mkt_event = None
+
+    if mkt_event is None:
+        mkt_event = MarketingEvent.objects.create(
+            id=f"mkt-{uuid.uuid4().hex[:8]}",
+            eventId=event_id,
+            eventName=event_name,
+            timestamp=now_str,
+            browserReported=data.get('browserReported', True),
+            serverCapiReported=True,
+            source=source,
+            campaign=campaign,
+            value=value if value is not None else 0,
+            orderId=order_id,
+            productName=str(product_name)[:255],
+            productId=str(product_id)[:100] if product_id else '',
+            dedupMatched=True
+        )
 
     return Response({
         'success': True,
@@ -447,15 +510,146 @@ def marketing_capi_event_view(request):
         'event': MarketingEventSerializer(mkt_event).data
     })
 
-@api_view(['GET', 'POST'])
+@api_view(['GET', 'POST', 'DELETE'])
 @permission_classes([AllowAny])
 def marketing_events_view(request):
-    if request.method == 'GET':
-        events = MarketingEvent.objects.all()[:100]
-        serializer = MarketingEventSerializer(events, many=True)
+    if request.method == 'DELETE':
+        deleted_cnt, _ = MarketingEvent.objects.all().delete()
         return Response({
             'success': True,
-            'events': serializer.data
+            'deletedCount': deleted_cnt,
+            'events': [],
+            'productAnalytics': [],
+            'message': 'Pixel event stream & product history cleared.'
+        })
+
+    if request.method == 'GET':
+        config = MarketingConfig.objects.first()
+        if config and not config.isActive:
+            return Response({
+                'success': True,
+                'isActive': False,
+                'activePixelId': config.pixelId,
+                'events': [],
+                'productAnalytics': [],
+            })
+
+        # Restrict strictly to currently active products in the Store catalog
+        from products.models import Product
+        active_by_id = {}
+        active_by_name = {}
+        for p in Product.objects.all().iterator():
+            pid_str = str(p.id).strip()
+            pname_str = str(p.name or '').strip()
+            active_by_id[pid_str] = p
+            if pname_str:
+                active_by_name[pname_str.lower()] = p
+
+        def match_active_product(pid, pname):
+            clean_pid = str(pid or '').strip()
+            if clean_pid and clean_pid in active_by_id:
+                return active_by_id[clean_pid]
+            raw_name = str(pname or '').strip()
+            # Strip trailing " (x1)" if present from checkout formatting
+            clean_name = raw_name.split(' (x')[0].strip().lower()
+            if clean_name and clean_name in active_by_name:
+                return active_by_name[clean_name]
+            return None
+
+        stats_map = {}
+        purchased_order_ids = set()
+        seen_purchase_pairs = set()
+        seen_event_ids = set()
+        active_events = []
+
+        def ensure_bucket(prod_obj):
+            if not prod_obj:
+                return None
+            key = str(prod_obj.id)
+            if key not in stats_map:
+                stats_map[key] = {
+                    'productId': key,
+                    'productName': str(prod_obj.name or f"Product #{key}"),
+                    'views': 0,
+                    'clicks': 0,
+                    'purchases': 0,
+                    'revenue': 0.0,
+                }
+            return stats_map[key]
+
+        for ev in MarketingEvent.objects.all().iterator():
+            ev_name = str(ev.eventName or '').strip()
+            if ev_name == 'PageView':
+                continue
+            matched_prod = match_active_product(ev.productId, ev.productName)
+            if not matched_prod:
+                continue
+
+            # Deduplicate identical Purchase rows for the same (orderId, productId)
+            if ev_name == 'Purchase' and ev.orderId:
+                pair_key = (str(ev.orderId), str(matched_prod.id))
+                if pair_key in seen_purchase_pairs:
+                    continue
+                seen_purchase_pairs.add(pair_key)
+
+            ev_key = str(ev.eventId or ev.id)
+            if ev_key in seen_event_ids:
+                continue
+            seen_event_ids.add(ev_key)
+
+            if len(active_events) < 200:
+                active_events.append(ev)
+
+            bucket = ensure_bucket(matched_prod)
+            if not bucket:
+                continue
+            if ev_name == 'ViewContent':
+                bucket['views'] += 1
+            elif ev_name in ('ProductClick', 'AddToCart', 'InitiateCheckout'):
+                bucket['clicks'] += 1
+            elif ev_name == 'Purchase':
+                bucket['purchases'] += 1
+                bucket['revenue'] += float(ev.value or 0)
+                if ev.orderId:
+                    purchased_order_ids.add(str(ev.orderId))
+
+        # Backfill any real non-failed active orders for active store products not yet counted
+        try:
+            from order.models import Order
+            for ord_obj in Order.objects.exclude(status__in=['CANCELLED', 'FAILED', 'RETURNED']).iterator():
+                oid_str = str(ord_obj.id)
+                if oid_str in purchased_order_ids:
+                    continue
+                if isinstance(ord_obj.items, list):
+                    for it in ord_obj.items:
+                        if not isinstance(it, dict):
+                            continue
+                        matched_prod = match_active_product(it.get('productId') or it.get('id'), it.get('name'))
+                        bucket = ensure_bucket(matched_prod)
+                        if bucket:
+                            pair_key = (oid_str, str(matched_prod.id))
+                            if pair_key in seen_purchase_pairs:
+                                continue
+                            seen_purchase_pairs.add(pair_key)
+                            qty = int(it.get('quantity') or 1)
+                            bucket['purchases'] += qty
+                            bucket['revenue'] += float(it.get('price') or 0) * qty
+        except Exception:
+            pass
+
+        product_analytics = sorted(
+            stats_map.values(),
+            key=lambda x: (x['purchases'] * 10 + x['clicks'] * 2 + x['views']),
+            reverse=True
+        )
+        serializer = MarketingEventSerializer(active_events, many=True)
+
+        return Response({
+            'success': True,
+            'isActive': bool(config.isActive) if config else True,
+            'activePixelId': config.pixelId if config else '',
+            'events': serializer.data,
+            'productAnalytics': product_analytics,
         })
     elif request.method == 'POST':
         data = request.data.copy()
