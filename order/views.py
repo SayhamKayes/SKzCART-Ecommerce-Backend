@@ -19,42 +19,34 @@ from core.recycle_bin import move_to_recycle_bin, snapshot_order
 from core.utils import calculate_delivery_fee, assess_order_risk, normalize_bangladesh_phone, get_id_prefixes
 from users.models import CustomerProfile
 
-@api_view(['POST'])
-@permission_classes([AllowAny])
-def checkout_view(request):
-    data = request.data
+def prepare_order_checkout_data(data):
+    """
+    Validates checkout items, verifies stock, and computes authoritative server totals.
+    Returns (prepared_dict, error_message_or_None).
+    """
     items = data.get('items', [])
-    address = data.get('address', {})
-    payment_method = data.get('paymentMethod', 'COD')
+    address = dict(data.get('address') or {})
+    payment_method = (data.get('paymentMethod') or 'COD').upper()
     coupon_code = data.get('couponCode')
     utm = data.get('utm', {})
 
     if not items or not address or not address.get('phone') or not address.get('customerName'):
-        return Response({
-            'success': False,
-            'message': 'Missing required order details'
-        }, status=status.HTTP_400_BAD_REQUEST)
+        return None, 'Missing required order details'
 
-    # Calculate subtotal using server product prices and verify stock availability
     subtotal = 0
     for item in items:
         prod_id = item.get('productId')
         prod = Product.objects.filter(id=prod_id).first()
         if prod and (prod.isOutOfStock or prod.stock <= 0):
-            return Response({
-                'success': False,
-                'message': f'"{prod.name}" is currently Out of Stock. Please remove it from your cart.'
-            }, status=status.HTTP_400_BAD_REQUEST)
+            return None, f'"{prod.name}" is currently Out of Stock. Please remove it from your cart.'
         unit_price = prod.price if prod else item.get('price', 0)
         subtotal += int(unit_price) * int(item.get('quantity', 1))
 
-    # Calculate Delivery fee
     district = address.get('district', '')
     delivery_calc = calculate_delivery_fee(district, address.get('fullAddress', ''))
     delivery_fee = delivery_calc['deliveryFee']
     address['deliveryZone'] = delivery_calc['deliveryZone']
 
-    # Coupon discount
     discount = 0
     if coupon_code:
         coupon = Coupon.objects.filter(code__iexact=coupon_code.strip(), isActive=True).first()
@@ -65,18 +57,70 @@ def checkout_view(request):
                 discount = int(coupon.value)
 
     grand_total = max(0, subtotal + delivery_fee - discount)
+    return {
+        'items': items,
+        'address': address,
+        'payment_method': payment_method,
+        'coupon_code': coupon_code,
+        'utm': utm,
+        'subtotal': subtotal,
+        'delivery_fee': delivery_fee,
+        'discount': discount,
+        'grand_total': grand_total,
+        'district': district,
+        'payment_trx_id': data.get('paymentTrxId') or address.get('paymentTrxId'),
+        'sender_wallet': data.get('senderWallet') or address.get('senderWallet'),
+        'customer_email': (data.get('customerEmail') or data.get('email') or address.get('email') or '').strip() or None,
+    }, None
 
-    # Generate unique Order ID and tracking token dynamically from configured prefix (defaults to 'BD')
+
+def create_order_from_payload(
+    data,
+    client_ip='127.0.0.1',
+    order_id_override=None,
+    payment_method_override=None,
+    payment_status_override=None,
+    initial_status='PENDING',
+    origin_note_override=None,
+    extra_address=None,
+    create_payment_txn=True,
+):
+    """
+    Creates a confirmed/pending Order in the database from validated checkout data,
+    deducts stock, saves customer profile, logs audit, and creates unified Live Gateway txn.
+    """
+    prepared, error_msg = prepare_order_checkout_data(data)
+    if error_msg:
+        return None, None, error_msg
+
+    items = prepared['items']
+    address = prepared['address']
+    if isinstance(extra_address, dict):
+        address.update(extra_address)
+
+    payment_method = (payment_method_override or prepared['payment_method'] or 'COD').upper()
+    subtotal = prepared['subtotal']
+    delivery_fee = prepared['delivery_fee']
+    discount = prepared['discount']
+    grand_total = prepared['grand_total']
+    district = prepared['district']
+    utm = prepared['utm']
+
     id_prefixes = get_id_prefixes()
     order_prefix = id_prefixes.get('orderIdPrefix') or 'BD'
+    order_id = order_id_override
+    if order_id and Order.objects.filter(id=order_id).exists():
+        order_id = None
+
     while True:
-        order_id = f"{order_prefix}-{random.randint(800000, 999999)}"
+        if not order_id:
+            order_id = f"{order_prefix}-{random.randint(800000, 999999)}"
         tracking_token = f"tr_{order_id.lower()}_{random.randint(1000, 9999)}"
         if not Order.objects.filter(id=order_id).exists() and not Order.objects.filter(trackingToken=tracking_token).exists():
             break
-    now_str = timezone.localtime().strftime('%Y-%m-%d %H:%M:%S')
+        order_id = None
 
-    # Assess fraud risk
+    now_str = timezone.localtime().strftime('%Y-%m-%d %H:%M:%S')
     risk_assessment = assess_order_risk(
         address.get('phone', ''),
         address.get('fullAddress', ''),
@@ -84,26 +128,47 @@ def checkout_view(request):
         payment_method
     )
 
-    client_ip = request.META.get('REMOTE_ADDR', '127.0.0.1')
     source_tag = utm.get('source') if isinstance(utm, dict) else None
-    origin_note = f"Order placed via Ad ({source_tag})" if source_tag else "Direct Guest Checkout"
+    origin_note = origin_note_override or (f"Order placed via Ad ({source_tag})" if source_tag else "Direct Guest Checkout")
 
-    payment_trx_id = data.get('paymentTrxId') or address.get('paymentTrxId')
-    sender_wallet = data.get('senderWallet') or address.get('senderWallet')
+    payment_trx_id = prepared['payment_trx_id']
+    sender_wallet = prepared['sender_wallet']
+    if payment_method in ('BKASH', 'NAGAD', 'ROCKET'):
+        if not payment_trx_id or len(str(payment_trx_id).strip()) < 4:
+            return None, None, f'A valid {payment_method} Transaction ID (TrxID) is required.'
+        try:
+            from payments.models import PaymentTransaction
+            dup_txn = PaymentTransaction.objects.filter(
+                tran_id__iexact=str(payment_trx_id).strip(),
+                status='VALIDATED',
+            ).first()
+            if dup_txn:
+                return None, None, f'Transaction ID {payment_trx_id} has already been verified for another order.'
+        except Exception:
+            pass
+
     if payment_trx_id:
         address['paymentTrxId'] = str(payment_trx_id).strip()
     if sender_wallet:
         address['senderWallet'] = str(sender_wallet).strip()
 
-    internal_notes = [f"Initial guest order submitted from IP {client_ip}"]
-    if payment_trx_id:
-        internal_notes.append(f"MFS Payment verified: Method={payment_method}, TrxID={payment_trx_id}, Sender={sender_wallet or 'N/A'}")
+    if 'verificationStatus' not in address:
+        address['verificationStatus'] = 'PENDING_VERIFICATION'
+    if 'paymentVerified' not in address:
+        address['paymentVerified'] = False
 
-    pay_status = 'UNPAID'
-    if payment_method != 'COD':
-        pay_status = 'PAID' if payment_trx_id else 'PENDING'
+    internal_notes = [f"Initial order submitted from IP {client_ip}"]
+    if payment_trx_id and payment_method != 'SSLCOMMERZ':
+        internal_notes.append(f"MFS Payment submitted: Method={payment_method}, TrxID={payment_trx_id}, Sender={sender_wallet or 'N/A'} (Awaiting Verification)")
 
-    cust_email = (data.get('customerEmail') or data.get('email') or address.get('email') or '').strip() or None
+    if payment_status_override:
+        pay_status = payment_status_override
+    elif payment_method == 'COD':
+        pay_status = 'UNPAID'
+    else:
+        pay_status = 'PENDING'
+
+    cust_email = prepared['customer_email']
     if cust_email:
         address['email'] = cust_email
 
@@ -120,9 +185,9 @@ def checkout_view(request):
         total=grand_total,
         paymentMethod=payment_method,
         paymentStatus=pay_status,
-        status='PENDING',
+        status=initial_status,
         statusHistory=[{
-            'status': 'PENDING',
+            'status': initial_status,
             'timestamp': now_str,
             'note': origin_note,
         }],
@@ -132,7 +197,6 @@ def checkout_view(request):
         internalNotes=internal_notes
     )
 
-    # Deduct stock atomically to prevent overselling
     for item in items:
         prod_id = item.get('productId')
         if prod_id:
@@ -146,7 +210,6 @@ def checkout_view(request):
                 else:
                     prod.save(update_fields=['stock'])
 
-    # Ensure customer profile is persisted in database
     cust_phone = normalize_bangladesh_phone(address.get('phone', ''))
     if cust_phone:
         cust_profile = CustomerProfile.objects.filter(phone=cust_phone).first()
@@ -173,10 +236,36 @@ def checkout_view(request):
                 cust_profile.fullAddress = address.get('fullAddress')
             cust_profile.save()
 
-    # Dispatch notifications
+    # Record unified Live Gateway transaction for COD / bKash / Nagad / Rocket
+    if create_payment_txn:
+        try:
+            from payments.models import PaymentTransaction
+            raw_trx = str(payment_trx_id).strip() if payment_trx_id else f"{payment_method}-{order.id}"
+            unique_trx = raw_trx
+            if PaymentTransaction.objects.filter(tran_id=unique_trx).exists():
+                unique_trx = f"{raw_trx}-{order.id}"
+            PaymentTransaction.objects.create(
+                order_id=order.id,
+                tran_id=unique_trx[:128],
+                amount=grand_total,
+                currency='BDT',
+                payment_method=payment_method,
+                status='INITIATED',
+                card_type='Cash on Delivery' if payment_method == 'COD' else f'{payment_method} Manual',
+                card_issuer=str(sender_wallet or ('Cash on Delivery' if payment_method == 'COD' else 'MFS Wallet'))[:128],
+                customer_name=str(address.get('customerName') or 'Customer')[:128],
+                customer_phone=str(address.get('phone') or '')[:32],
+                raw_payload={
+                    'source': 'checkout',
+                    'customer_trx_id': payment_trx_id,
+                    'sender_wallet': sender_wallet,
+                }
+            )
+        except Exception as txn_err:
+            logger.warning(f"Failed creating unified PaymentTransaction for {order.id}: {txn_err}")
+
     dispatch_order_notifications(order, 'ORDER_CREATED')
 
-    # Audit log
     AuditLog.log(
         actor=address.get('customerName', 'Guest Customer'),
         role='SYSTEM',
@@ -186,6 +275,21 @@ def checkout_view(request):
         details=f"New order created for ৳{grand_total} ({payment_method}). Phone: {address.get('phone')}, District: {district}",
         ip_address=client_ip
     )
+
+    return order, tracking_token, None
+
+
+@api_view(['POST'])
+@permission_classes([AllowAny])
+def checkout_view(request):
+    data = request.data
+    client_ip = request.META.get('REMOTE_ADDR', '127.0.0.1')
+    order, tracking_token, error_msg = create_order_from_payload(data, client_ip=client_ip)
+    if error_msg or not order:
+        return Response({
+            'success': False,
+            'message': error_msg or 'Failed to create order'
+        }, status=status.HTTP_400_BAD_REQUEST)
 
     serializer = OrderSerializer(order)
     return Response({
@@ -297,6 +401,11 @@ def order_detail(request, pk):
         snap = snapshot_order(order)
         order.delete()
         rb = move_to_recycle_bin(**snap, deleted_by='Admin')
+        try:
+            from core.models import MarketingEvent
+            MarketingEvent.objects.filter(orderId=oid).delete()
+        except Exception:
+            pass
         AuditLog.log(
             actor='Admin',
             role='ADMIN',
@@ -335,6 +444,13 @@ def bulk_delete_orders(request):
         move_to_recycle_bin(**snap, deleted_by='Admin')
         deleted_count += 1
 
+    if deleted_ids:
+        try:
+            from core.models import MarketingEvent
+            MarketingEvent.objects.filter(orderId__in=deleted_ids).delete()
+        except Exception:
+            pass
+
     AuditLog.log(
         actor='Admin',
         role='ADMIN',
@@ -367,6 +483,22 @@ def update_order_status(request, pk):
         return Response({'success': False, 'message': 'Missing status'}, status=status.HTTP_400_BAD_REQUEST)
 
     prev_status = order.status
+    if new_status == 'CONFIRMED' and prev_status == 'PENDING':
+        addr = order.address if isinstance(order.address, dict) else {}
+        ver_status = addr.get('verificationStatus')
+        is_cod = str(order.paymentMethod or '').upper() == 'COD'
+        if is_cod:
+            if ver_status == 'NOT_VERIFIED' or order.paymentStatus == 'FAILED':
+                return Response({
+                    'success': False,
+                    'message': 'This COD order is marked Not Verified and cannot be confirmed.'
+                }, status=status.HTTP_400_BAD_REQUEST)
+        elif ver_status != 'VERIFIED' or order.paymentStatus == 'FAILED':
+            return Response({
+                'success': False,
+                'message': 'Payment/order verification is required before confirming this order.'
+            }, status=status.HTTP_400_BAD_REQUEST)
+
     order.status = new_status
     now_str = timezone.localtime().strftime('%Y-%m-%d %H:%M:%S')
 
@@ -474,6 +606,9 @@ def tracking_lookup(request):
             'createdAt': matched_order.createdAt,
             'status': matched_order.status,
             'statusHistory': matched_order.statusHistory if isinstance(matched_order.statusHistory, list) else [],
+            'subtotal': matched_order.subtotal,
+            'deliveryFee': matched_order.deliveryFee,
+            'discount': matched_order.discount,
             'total': matched_order.total,
             'paymentMethod': matched_order.paymentMethod,
             'paymentStatus': matched_order.paymentStatus,
