@@ -206,6 +206,12 @@ def product_detail_update(request, pk):
         snap = snapshot_product(product)
         product.delete()
         rb = move_to_recycle_bin(**snap, deleted_by='Admin')
+        try:
+            from core.models import MarketingEvent
+            from django.db.models import Q
+            MarketingEvent.objects.filter(Q(productId=prod_id) | Q(productName__iexact=prod_name)).delete()
+        except Exception:
+            pass
         AuditLog.log(
             actor='Admin',
             role='ADMIN',
@@ -1188,6 +1194,13 @@ def bulk_delete_products(request):
         prod.delete()
         move_to_recycle_bin(**snap, deleted_by='Admin')
         deleted_count += 1
+
+    try:
+        from core.models import MarketingEvent
+        from django.db.models import Q
+        MarketingEvent.objects.filter(Q(productId__in=product_ids) | Q(productName__in=deleted_names)).delete()
+    except Exception:
+        pass
 
     AuditLog.log(
         actor='Admin',
