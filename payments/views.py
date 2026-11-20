@@ -75,10 +75,13 @@ def initiate_payment_view(request):
     """
     POST /api/v1/payments/initiate
     Initiates payment session with SSLCommerz and returns GatewayPageURL.
+    Accepts either existing orderId OR deferred full checkout payload (items, address, etc.).
     """
-    data = request.data
+    data = request.data or {}
     order_id = data.get('orderId') or data.get('order_id')
-    amount = data.get('amount')
+    amount = data.get('amount') or data.get('totalAmount')
+    items = data.get('items')
+    has_checkout_items = isinstance(items, list) and len(items) > 0
     customer_data = data.get('customerData') or data.get('address') or {
         'customerName': data.get('customerName') or data.get('name'),
         'phone': data.get('phone') or data.get('customerPhone'),
@@ -87,17 +90,18 @@ def initiate_payment_view(request):
         'district': data.get('district'),
     }
 
-    if not order_id:
+    if not order_id and not has_checkout_items:
         return Response({
             'success': False,
-            'message': 'Order ID is required to initiate payment'
+            'message': 'Order ID or checkout items are required to initiate payment'
         }, status=status.HTTP_400_BAD_REQUEST)
 
     result = initiate_sslcommerz_payment(
         order_id=order_id,
         amount=amount,
         customer_data=customer_data,
-        request=request
+        request=request,
+        checkout_payload=data if has_checkout_items else None,
     )
 
     if result.get('success'):
@@ -736,60 +740,218 @@ def payment_config_view(request):
 def payment_verify_view(request):
     """
     POST /api/v1/payments/verify
-    Manually verifies or syncs a transaction with SSLCommerz.
+    Unified verification endpoint for SSLCommerz, MFS (bKash/Nagad/Rocket), and COD.
+    Supports action='verify' (default) and action='not_verified'.
     """
-    tran_id = request.data.get('tran_id')
-    val_id = request.data.get('val_id')
+    from django.utils import timezone
+    from order.serializers import OrderSerializer
+
+    data = request.data or {}
+    tran_id = data.get('tran_id') or data.get('tranId')
+    val_id = data.get('val_id') or data.get('valId')
+    order_id = data.get('orderId') or data.get('order_id')
+    action = str(data.get('action') or 'verify').lower().strip()
+    note = str(data.get('note') or '').strip()
 
     transaction = None
     if tran_id:
         transaction = PaymentTransaction.objects.filter(tran_id=tran_id).first()
     elif val_id:
         transaction = PaymentTransaction.objects.filter(val_id=val_id).first()
+    if not transaction and order_id:
+        transaction = PaymentTransaction.objects.filter(order_id=order_id).order_by('-created_at').first()
 
-    if not transaction:
+    resolved_order_id = order_id or (transaction.order_id if transaction else None)
+    order = Order.objects.filter(id=resolved_order_id).first() if resolved_order_id else None
+
+    if not transaction and not order:
         return Response({
             'success': False,
-            'message': 'Transaction not found'
+            'message': 'Order or payment transaction not found'
         }, status=status.HTTP_404_NOT_FOUND)
 
-    effective_val_id = val_id or transaction.val_id
-    if not effective_val_id:
-        config = get_gateway_config()
-        if config.is_sandbox:
-            effective_val_id = f"SANDBOX-VAL-{transaction.tran_id}"
+    method = (
+        (order.paymentMethod if order else None)
+        or (transaction.payment_method if transaction else None)
+        or 'SSLCOMMERZ'
+    ).upper()
+    now_str = timezone.localtime().strftime('%Y-%m-%d %H:%M:%S')
+
+    if action == 'not_verified':
+        reason = note or 'Marked as Payment Not Verified by admin.'
+        if order:
+            address = dict(order.address) if isinstance(order.address, dict) else {}
+            address['paymentVerified'] = False
+            address['verificationStatus'] = 'NOT_VERIFIED'
+            order.address = address
+            order.paymentStatus = 'FAILED'
+            history = list(order.statusHistory) if isinstance(order.statusHistory, list) else []
+            history.append({
+                'status': order.status,
+                'timestamp': now_str,
+                'note': reason,
+                'updatedBy': 'Admin Verification'
+            })
+            order.statusHistory = history
+            order.save()
+
+        if transaction:
+            transaction.status = 'FAILED'
+            transaction.error_reason = reason
+            transaction.save()
+
+        AuditLog.log(
+            actor='Admin',
+            role='ADMIN',
+            action='PAYMENT_NOT_VERIFIED',
+            target_type='ORDER',
+            target_id=resolved_order_id or (transaction.tran_id if transaction else 'UNKNOWN'),
+            details=f"{method} marked Not Verified: {reason}",
+            ip_address=request.META.get('REMOTE_ADDR', '127.0.0.1')
+        )
+        return Response({
+            'success': True,
+            'verified': False,
+            'verificationStatus': 'NOT_VERIFIED',
+            'message': 'Marked as Payment Not Verified.',
+            'order': OrderSerializer(order).data if order else None,
+            'transaction': PaymentTransactionSerializer(transaction).data if transaction else None,
+        })
+
+    # Action: Verify
+    if method == 'SSLCOMMERZ':
+        if not transaction:
+            return Response({
+                'success': False,
+                'message': 'SSLCommerz transaction record is missing.'
+            }, status=status.HTTP_404_NOT_FOUND)
+
+        effective_val_id = val_id or transaction.val_id or (
+            order.address.get('valId') if order and isinstance(order.address, dict) else None
+        )
+        if not effective_val_id:
+            config = get_gateway_config()
+            if config.is_sandbox and transaction.status == 'VALIDATED':
+                effective_val_id = f"SANDBOX-VAL-{transaction.tran_id}"
+            else:
+                return Response({
+                    'success': False,
+                    'message': 'Validation ID (val_id) is missing. Customer has not completed SSLCommerz payment.'
+                }, status=status.HTTP_400_BAD_REQUEST)
+
+        val_result = validate_sslcommerz_transaction(effective_val_id, transaction.tran_id)
+        if val_result.get('status') in ['VALID', 'VALIDATED']:
+            payload = {
+                'tran_id': transaction.tran_id,
+                'val_id': effective_val_id,
+                'amount': str(transaction.amount),
+                'card_type': val_result.get('card_type') or transaction.card_type,
+                'card_issuer': val_result.get('card_issuer') or transaction.card_issuer,
+                'bank_tran_id': val_result.get('bank_tran_id') or transaction.bank_tran_id,
+            }
+            process_payment_success(payload)
+            transaction.refresh_from_db()
+            order = Order.objects.filter(id=transaction.order_id).first()
+            if order:
+                address = dict(order.address) if isinstance(order.address, dict) else {}
+                address['paymentVerified'] = True
+                address['verificationStatus'] = 'VERIFIED'
+                order.address = address
+                order.save()
+
+            AuditLog.log(
+                actor='Admin',
+                role='ADMIN',
+                action='PAYMENT_VERIFIED',
+                target_type='ORDER',
+                target_id=transaction.order_id,
+                details=f"SSLCommerz payment verified via server (TrxID: {transaction.tran_id})",
+                ip_address=request.META.get('REMOTE_ADDR', '127.0.0.1')
+            )
+            return Response({
+                'success': True,
+                'verified': True,
+                'verificationStatus': 'VERIFIED',
+                'message': 'SSLCommerz transaction verified successfully.',
+                'order': OrderSerializer(order).data if order else None,
+                'transaction': PaymentTransactionSerializer(transaction).data,
+                'validation': val_result
+            })
         else:
             return Response({
                 'success': False,
-                'message': 'Validation ID (val_id) is missing for this transaction'
+                'verified': False,
+                'message': f"Validation check returned: {val_result.get('status')}",
+                'validation': val_result
             }, status=status.HTTP_400_BAD_REQUEST)
 
-    val_result = validate_sslcommerz_transaction(effective_val_id, transaction.tran_id)
+    # MFS (bKash / Nagad / Rocket) & COD unified verification
+    if method in ('BKASH', 'NAGAD', 'ROCKET'):
+        import re
+        submitted_trx = str(
+            tran_id
+            or (order.address.get('paymentTrxId') if order and isinstance(order.address, dict) else None)
+            or (transaction.tran_id if transaction else '')
+            or ''
+        ).strip()
+        if not re.match(r'^[A-Za-z0-9_-]{4,40}$', submitted_trx):
+            return Response({
+                'success': False,
+                'message': f'Valid {method} Transaction ID (TrxID, min 4 alphanumeric chars) is required.'
+            }, status=status.HTTP_400_BAD_REQUEST)
+        # Prevent duplicate MFS TrxID validation across multiple different orders
+        dup_txn = PaymentTransaction.objects.filter(
+            tran_id__iexact=submitted_trx,
+            status='VALIDATED',
+        ).exclude(order_id=resolved_order_id).first()
+        if dup_txn:
+            return Response({
+                'success': False,
+                'message': f'Transaction ID {submitted_trx} was already verified for Order #{dup_txn.order_id}. Possible duplicate payment.'
+            }, status=status.HTTP_400_BAD_REQUEST)
 
-    if val_result.get('status') in ['VALID', 'VALIDATED']:
-        payload = {
-            'tran_id': transaction.tran_id,
-            'val_id': effective_val_id,
-            'amount': str(transaction.amount),
-            'card_type': val_result.get('card_type') or transaction.card_type,
-            'card_issuer': val_result.get('card_issuer') or transaction.card_issuer,
-            'bank_tran_id': val_result.get('bank_tran_id') or transaction.bank_tran_id,
-        }
-        process_payment_success(payload)
-        transaction.refresh_from_db()
-
-        return Response({
-            'success': True,
-            'message': 'Transaction verified and marked as VALIDATED/PAID',
-            'transaction': PaymentTransactionSerializer(transaction).data,
-            'validation': val_result
+    if order:
+        address = dict(order.address) if isinstance(order.address, dict) else {}
+        address['paymentVerified'] = True
+        address['verificationStatus'] = 'VERIFIED'
+        order.address = address
+        if method in ('BKASH', 'NAGAD', 'ROCKET'):
+            order.paymentStatus = 'PAID'
+        elif method == 'COD' and order.paymentStatus == 'FAILED':
+            order.paymentStatus = 'UNPAID'
+        history = list(order.statusHistory) if isinstance(order.statusHistory, list) else []
+        history.append({
+            'status': order.status,
+            'timestamp': now_str,
+            'note': note or f"{method} payment/order verified by Admin.",
+            'updatedBy': 'Admin Verification'
         })
-    else:
-        return Response({
-            'success': False,
-            'message': f"Validation check returned: {val_result.get('status')}",
-            'validation': val_result
-        }, status=status.HTTP_400_BAD_REQUEST)
+        order.statusHistory = history
+        order.save()
+
+    if transaction:
+        transaction.status = 'VALIDATED'
+        transaction.error_reason = ''
+        transaction.save()
+
+    AuditLog.log(
+        actor='Admin',
+        role='ADMIN',
+        action='PAYMENT_VERIFIED',
+        target_type='ORDER',
+        target_id=resolved_order_id or (transaction.tran_id if transaction else 'UNKNOWN'),
+        details=f"{method} verified by Admin",
+        ip_address=request.META.get('REMOTE_ADDR', '127.0.0.1')
+    )
+
+    return Response({
+        'success': True,
+        'verified': True,
+        'verificationStatus': 'VERIFIED',
+        'message': f'{method} verified successfully. Order is ready to confirm.',
+        'order': OrderSerializer(order).data if order else None,
+        'transaction': PaymentTransactionSerializer(transaction).data if transaction else None,
+    })
 
 
 @api_view(['GET', 'POST'])
