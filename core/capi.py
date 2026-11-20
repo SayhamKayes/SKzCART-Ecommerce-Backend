@@ -66,7 +66,6 @@ def send_meta_capi_event(
         "event_name": event_name,
         "event_time": int(time.time()),
         "event_id": event_id,
-        "event_source_url": event_source_url or "http://localhost:3001/",
         "action_source": "website",
         "user_data": user_data,
         "custom_data": custom_data or {
@@ -74,6 +73,8 @@ def send_meta_capi_event(
             "value": 0
         }
     }
+    if event_source_url:
+        event_payload["event_source_url"] = event_source_url
 
     body = {
         "data": [event_payload],
