@@ -291,3 +291,220 @@ class RecycleBinItem(models.Model):
     def __str__(self):
         return f"[{self.item_type}] {self.title} ({self.original_id})"
 
+
+class StoreTenant(models.Model):
+    """Multi-tenant SaaS Seller Store entity allowing isolated Meta Ads & Page Boost management per seller."""
+    STATUS_CHOICES = [
+        ('ACTIVE', 'Active'),
+        ('SUSPENDED', 'Suspended'),
+    ]
+    PLAN_CHOICES = [
+        ('STARTER', 'Starter'),
+        ('PRO', 'Pro'),
+        ('ENTERPRISE', 'Enterprise'),
+    ]
+
+    id = models.CharField(max_length=64, primary_key=True)
+    tenantId = models.CharField(max_length=64, unique=True, db_index=True)
+    storeName = models.CharField(max_length=200)
+    domainUrl = models.CharField(max_length=255, blank=True, default='')
+    ownerName = models.CharField(max_length=150, blank=True, default='')
+    ownerEmail = models.CharField(max_length=150, blank=True, default='')
+    plan = models.CharField(max_length=20, choices=PLAN_CHOICES, default='PRO')
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='ACTIVE')
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ['created_at']
+
+    def __str__(self):
+        return f"{self.storeName} ({self.tenantId})"
+
+
+class MetaTenantConnection(models.Model):
+    """Encrypted, tenant-isolated Meta OAuth / System User credentials, Ad Account billing health, and Page/Pixel bindings."""
+    TOKEN_TYPE_CHOICES = [
+        ('OAUTH', 'Facebook OAuth User Token'),
+        ('SYSTEM_USER', 'Business System User Token'),
+    ]
+
+    id = models.CharField(max_length=64, primary_key=True)
+    tenantId = models.CharField(max_length=64, unique=True, db_index=True)
+    metaAppId = models.CharField(max_length=100, blank=True, default='')
+    metaUserId = models.CharField(max_length=100, blank=True, default='')
+    metaUserName = models.CharField(max_length=200, blank=True, default='')
+
+    accessTokenEncrypted = models.TextField(blank=True, default='')
+    tokenMasked = models.CharField(max_length=64, blank=True, default='')
+    tokenType = models.CharField(max_length=20, choices=TOKEN_TYPE_CHOICES, default='OAUTH')
+    tokenExpiresAt = models.DateTimeField(null=True, blank=True)
+    grantedScopes = models.JSONField(default=list, blank=True)
+
+    # Bound Meta Assets for this Seller Store
+    adAccountId = models.CharField(max_length=100, blank=True, default='')
+    adAccountName = models.CharField(max_length=200, blank=True, default='')
+    adAccountCurrency = models.CharField(max_length=16, blank=True, default='BDT')
+    adAccountStatus = models.CharField(max_length=50, blank=True, default='UNKNOWN')
+    billingStatus = models.CharField(max_length=50, blank=True, default='UNVERIFIED')
+    billingAlertMessage = models.TextField(blank=True, default='')
+    fundingSourceSummary = models.CharField(max_length=255, blank=True, default='')
+    spendCap = models.FloatField(default=0)
+    amountSpent = models.FloatField(default=0)
+    accountBalance = models.FloatField(default=0)
+    isSandboxMode = models.BooleanField(default=False)
+
+    pageId = models.CharField(max_length=100, blank=True, default='')
+    pageName = models.CharField(max_length=200, blank=True, default='')
+    pageCategory = models.CharField(max_length=150, blank=True, default='')
+    pageAccessTokenEncrypted = models.TextField(blank=True, default='')
+    instagramActorId = models.CharField(max_length=100, blank=True, default='')
+    pixelId = models.CharField(max_length=100, blank=True, default='')
+
+    availableAdAccounts = models.JSONField(default=list, blank=True)
+    availablePages = models.JSONField(default=list, blank=True)
+    availablePixels = models.JSONField(default=list, blank=True)
+
+    isConnected = models.BooleanField(default=False)
+    lastError = models.TextField(blank=True, default='')
+    lastSyncedAt = models.DateTimeField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ['-updated_at']
+
+    def __str__(self):
+        return f"MetaTenantConnection({self.tenantId}) - {self.adAccountId or 'Unbound'}"
+
+
+class SaaSAdCampaign(models.Model):
+    """Tenant-isolated Meta Ad Campaign synced two-way with Meta Graph API and store UTM attribution."""
+    CAMPAIGN_TYPE_CHOICES = [
+        ('PRODUCT_SALES', 'Product Sales Campaign'),
+        ('QUICK_BOOST_PRODUCT', 'Quick Product Boost'),
+        ('QUICK_BOOST_POST', 'Facebook Page Post Boost'),
+        ('TRAFFIC', 'Website Traffic'),
+        ('MESSAGES', 'Page Messages'),
+    ]
+
+    id = models.CharField(max_length=64, primary_key=True)
+    tenantId = models.CharField(max_length=64, db_index=True, default='default')
+    metaCampaignId = models.CharField(max_length=100, blank=True, default='', db_index=True)
+    adAccountId = models.CharField(max_length=100, blank=True, default='')
+    source = models.CharField(max_length=30, default='facebook')
+    campaignType = models.CharField(max_length=30, choices=CAMPAIGN_TYPE_CHOICES, default='PRODUCT_SALES')
+
+    name = models.CharField(max_length=255)
+    objective = models.CharField(max_length=60, default='OUTCOME_SALES')
+    status = models.CharField(max_length=30, default='PAUSED')
+    effectiveStatus = models.CharField(max_length=50, default='PAUSED')
+
+    productId = models.CharField(max_length=100, blank=True, default='')
+    productName = models.CharField(max_length=255, blank=True, default='')
+    postId = models.CharField(max_length=150, blank=True, default='')
+    landingUrl = models.TextField(blank=True, default='')
+    utmCampaign = models.CharField(max_length=150, blank=True, default='', db_index=True)
+
+    dailyBudget = models.FloatField(default=0)
+    lifetimeBudget = models.FloatField(default=0)
+    currency = models.CharField(max_length=16, default='BDT')
+
+    # Meta Delivery & Billing Guard feedback
+    billingGuardAlert = models.TextField(blank=True, default='')
+    deliveryStatusDetail = models.TextField(blank=True, default='')
+
+    # Live Meta Insights + Store Order Attribution
+    spend = models.FloatField(default=0)
+    impressions = models.IntegerField(default=0)
+    reach = models.IntegerField(default=0)
+    clicks = models.IntegerField(default=0)
+    ctr = models.FloatField(default=0)
+    cpc = models.FloatField(default=0)
+    cpm = models.FloatField(default=0)
+    metaPurchases = models.IntegerField(default=0)
+    storeOrders = models.IntegerField(default=0)
+    storeRevenue = models.FloatField(default=0)
+    roas = models.FloatField(default=0)
+
+    isRemoteSynced = models.BooleanField(default=False)
+    lastSyncedAt = models.DateTimeField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ['-created_at']
+
+    def __str__(self):
+        return f"[{self.tenantId}] {self.name} ({self.effectiveStatus})"
+
+
+class SaaSAdSet(models.Model):
+    """Tenant-isolated Meta Ad Set belonging to a SaaSAdCampaign."""
+    id = models.CharField(max_length=64, primary_key=True)
+    tenantId = models.CharField(max_length=64, db_index=True, default='default')
+    campaign = models.ForeignKey(SaaSAdCampaign, related_name='adsets', on_delete=models.CASCADE)
+    metaAdSetId = models.CharField(max_length=100, blank=True, default='', db_index=True)
+
+    name = models.CharField(max_length=255)
+    status = models.CharField(max_length=30, default='PAUSED')
+    effectiveStatus = models.CharField(max_length=50, default='PAUSED')
+    optimizationGoal = models.CharField(max_length=60, default='OFFSITE_CONVERSIONS')
+    billingEvent = models.CharField(max_length=40, default='IMPRESSIONS')
+
+    dailyBudget = models.FloatField(default=0)
+    lifetimeBudget = models.FloatField(default=0)
+    startTime = models.DateTimeField(null=True, blank=True)
+    endTime = models.DateTimeField(null=True, blank=True)
+    targeting = models.JSONField(default=dict, blank=True)
+    estimatedReachMin = models.IntegerField(default=0)
+    estimatedReachMax = models.IntegerField(default=0)
+
+    spend = models.FloatField(default=0)
+    impressions = models.IntegerField(default=0)
+    reach = models.IntegerField(default=0)
+    clicks = models.IntegerField(default=0)
+    ctr = models.FloatField(default=0)
+    cpc = models.FloatField(default=0)
+
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ['created_at']
+
+
+class SaaSAdCreativeAd(models.Model):
+    """Tenant-isolated Meta Creative & Ad node with policy review feedback."""
+    id = models.CharField(max_length=64, primary_key=True)
+    tenantId = models.CharField(max_length=64, db_index=True, default='default')
+    adset = models.ForeignKey(SaaSAdSet, related_name='ads', on_delete=models.CASCADE)
+    metaCreativeId = models.CharField(max_length=100, blank=True, default='')
+    metaAdId = models.CharField(max_length=100, blank=True, default='', db_index=True)
+
+    name = models.CharField(max_length=255)
+    status = models.CharField(max_length=30, default='PAUSED')
+    effectiveStatus = models.CharField(max_length=50, default='PAUSED')
+
+    primaryText = models.TextField(blank=True, default='')
+    headline = models.CharField(max_length=255, blank=True, default='')
+    description = models.TextField(blank=True, default='')
+    callToAction = models.CharField(max_length=40, default='SHOP_NOW')
+    imageUrl = models.TextField(blank=True, default='')
+    imageHash = models.CharField(max_length=150, blank=True, default='')
+    linkUrl = models.TextField(blank=True, default='')
+    objectStoryId = models.CharField(max_length=150, blank=True, default='')
+    reviewFeedback = models.JSONField(default=dict, blank=True)
+
+    spend = models.FloatField(default=0)
+    impressions = models.IntegerField(default=0)
+    reach = models.IntegerField(default=0)
+    clicks = models.IntegerField(default=0)
+
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ['created_at']
+
+
