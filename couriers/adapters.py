@@ -18,6 +18,60 @@ class BaseCourierAdapter:
     def parse_webhook(self, payload):
         raise NotImplementedError
 
+    def extract_rider_info(self, payload):
+        """Extract live rider name, phone, and hub location from courier API/webhook payloads if present."""
+        if not isinstance(payload, dict):
+            return {}
+        nested_data = payload.get('data') if isinstance(payload.get('data'), dict) else {}
+        delivery_man = (
+            payload.get('delivery_man')
+            or payload.get('rider')
+            or nested_data.get('delivery_man')
+            or nested_data.get('rider')
+            or {}
+        )
+        dm_dict = delivery_man if isinstance(delivery_man, dict) else {}
+
+        rider_name = str(
+            payload.get('rider_name')
+            or payload.get('delivery_man_name')
+            or payload.get('driver_name')
+            or payload.get('courier_man_name')
+            or nested_data.get('rider_name')
+            or nested_data.get('delivery_man_name')
+            or dm_dict.get('name')
+            or (delivery_man if isinstance(delivery_man, str) else '')
+            or ''
+        ).strip()
+
+        rider_phone = str(
+            payload.get('rider_phone')
+            or payload.get('delivery_man_phone')
+            or payload.get('delivery_man_mobile')
+            or payload.get('driver_phone')
+            or payload.get('courier_man_phone')
+            or nested_data.get('rider_phone')
+            or nested_data.get('delivery_man_phone')
+            or dm_dict.get('phone')
+            or dm_dict.get('mobile')
+            or ''
+        ).strip()
+
+        hub_location = str(
+            payload.get('hub_name')
+            or payload.get('sorting_hub')
+            or payload.get('branch_name')
+            or nested_data.get('hub_name')
+            or nested_data.get('branch_name')
+            or ''
+        ).strip()
+
+        return {
+            'assignedRiderName': rider_name,
+            'assignedRiderPhone': normalize_bangladesh_phone(rider_phone) if rider_phone else '',
+            'hubLocation': hub_location,
+        }
+
 
 class PathaoAdapter(BaseCourierAdapter):
     BASE_URL = "https://api-hermes.pathao.com"
@@ -86,22 +140,23 @@ class PathaoAdapter(BaseCourierAdapter):
             token, auth_err = self.get_access_token()
             if not token:
                 raise ValueError(auth_err or "Pathao authentication failed. Check Pathao credentials in Courier Hub.")
+            city_id, zone_id = self.resolve_city_zone(token, district, address_dict.get('thana', ''))
+            payload = {
+                "store_id": int(store_id) if str(store_id).isdigit() else 1,
+                "merchant_order_id": str(order.id),
+                "recipient_name": recipient_name,
+                "recipient_phone": recipient_phone,
+                "recipient_address": full_address,
+                "recipient_city": city_id,
+                "recipient_zone": zone_id,
+                "delivery_type": 48,
+                "item_type": 2,
+                "special_instruction": note,
+                "item_quantity": 1,
+                "item_weight": float(item_weight_kg),
+                "amount_to_collect": int(cod_amount)
+            }
             if True:
-                payload = {
-                    "store_id": int(store_id) if str(store_id).isdigit() else 1,
-                    "merchant_order_id": str(order.id),
-                    "recipient_name": recipient_name,
-                    "recipient_phone": recipient_phone,
-                    "recipient_address": full_address,
-                    "recipient_city": 1,
-                    "recipient_zone": 1,
-                    "delivery_type": 48,
-                    "item_type": 2,
-                    "special_instruction": note,
-                    "item_quantity": 1,
-                    "item_weight": float(item_weight_kg),
-                    "amount_to_collect": int(cod_amount)
-                }
                 try:
                     resp = requests.post(
                         f"{self.BASE_URL}/aladdin/api/v1/orders",
@@ -117,7 +172,8 @@ class PathaoAdapter(BaseCourierAdapter):
                     if resp.status_code in [200, 201] and (data.get('type') == 'success' or data.get('data')):
                         c_data = data.get('data', {})
                         consignment_id = str(c_data.get('consignment_id') or c_data.get('order_id') or '')
-                        tracking_id = consignment_id
+                        tracking_id = str(c_data.get('tracking_code') or c_data.get('consignment_id') or consignment_id)
+                        rider_info = self.extract_rider_info(data)
                         return {
                             'provider': 'pathao',
                             'trackingId': tracking_id,
@@ -127,9 +183,9 @@ class PathaoAdapter(BaseCourierAdapter):
                             'deliveryFee': delivery_fee,
                             'codAmount': cod_amount,
                             'trackingUrl': f"https://pathao.com/courier/tracking?consignment={consignment_id}",
-                            'hubLocation': 'Tejgaon Central Sorting Hub' if is_dhaka else 'Dhaka Transit Departure Hub',
-                            'assignedRiderName': 'Pathao Fleet Agent',
-                            'assignedRiderPhone': '01700123456',
+                            'hubLocation': rider_info.get('hubLocation') or ('Tejgaon Central Sorting Hub' if is_dhaka else 'Dhaka Transit Departure Hub'),
+                            'assignedRiderName': rider_info.get('assignedRiderName', ''),
+                            'assignedRiderPhone': rider_info.get('assignedRiderPhone', ''),
                             'liveApi': True,
                         }
                     else:
@@ -186,18 +242,77 @@ class PathaoAdapter(BaseCourierAdapter):
             'message': 'Pathao OAuth2 live token authenticated successfully (Pathao API does not expose wallet balance endpoint).'
         }
 
+    def resolve_city_zone(self, token, district, thana=""):
+        """Dynamically resolve Pathao city_id & zone_id from district/thana, falling back safely to Dhaka (1, 1)."""
+        city_id, zone_id = 1, 1
+        d_clean = str(district or '').strip().lower()
+        t_clean = str(thana or '').strip().lower()
+        if not d_clean:
+            return city_id, zone_id
+        try:
+            headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
+            c_resp = requests.get(f"{self.BASE_URL}/aladdin/api/v1/city-list", headers=headers, timeout=8)
+            c_data = c_resp.json().get('data', {}).get('data', []) if c_resp.status_code == 200 else []
+            for c in c_data:
+                if d_clean in str(c.get('city_name', '')).lower():
+                    city_id = int(c.get('city_id', 1))
+                    break
+            if t_clean:
+                z_resp = requests.get(f"{self.BASE_URL}/aladdin/api/v1/cities/{city_id}/zone-list", headers=headers, timeout=8)
+                z_data = z_resp.json().get('data', {}).get('data', []) if z_resp.status_code == 200 else []
+                for z in z_data:
+                    if t_clean in str(z.get('zone_name', '')).lower():
+                        zone_id = int(z.get('zone_id', 1))
+                        break
+                if zone_id == 1 and z_data:
+                    zone_id = int(z_data[0].get('zone_id', 1))
+        except Exception as e:
+            logger.warning(f"Pathao city/zone lookup fallback for {district}/{thana}: {e}")
+        return city_id, zone_id
+
     def check_status(self, tracking_code):
-        return {'status': 200, 'tracking_id': tracking_code, 'provider': 'pathao'}
+        client_id, client_secret, _, _, _ = self.get_credentials()
+        if not client_id or client_id == 'pk_live_pathao_merchant_92813':
+            return {'status': 200, 'tracking_id': tracking_code, 'provider': 'pathao', 'isDemo': True}
+        token, auth_err = self.get_access_token()
+        if not token:
+            return {'status': 401, 'message': auth_err or 'Pathao authentication failed'}
+        try:
+            resp = requests.get(
+                f"{self.BASE_URL}/aladdin/api/v1/orders/{tracking_code}/info",
+                headers={"Authorization": f"Bearer {token}", "Accept": "application/json"},
+                timeout=10
+            )
+            data = resp.json() if resp.text else {}
+            info = data.get('data') if isinstance(data.get('data'), dict) else data
+            return {
+                'status': resp.status_code,
+                'provider': 'pathao',
+                'tracking_id': tracking_code,
+                'order_status': info.get('order_status') or info.get('order_status_slug') or '',
+                'raw': data,
+            }
+        except Exception as e:
+            return {'status': 500, 'message': str(e)}
 
     def parse_webhook(self, payload):
-        event = str(payload.get('event') or payload.get('order_status') or payload.get('status') or '').lower().strip()
+        nested = payload.get('data') if isinstance(payload.get('data'), dict) else {}
+        event = str(
+            payload.get('event')
+            or payload.get('order_status')
+            or payload.get('order_status_slug')
+            or payload.get('status')
+            or nested.get('order_status')
+            or ''
+        ).lower().strip()
         mapping = {
             'order.delivered': ('DELIVERED', 'Parcel successfully delivered to recipient (Pathao)'),
             'delivered': ('DELIVERED', 'Parcel successfully delivered to recipient (Pathao)'),
             'order.in_transit': ('IN_TRANSIT', 'Parcel in transit to destination hub (Pathao)'),
             'in_transit': ('IN_TRANSIT', 'Parcel in transit to destination hub (Pathao)'),
-            'order.picked_up': ('IN_TRANSIT', 'Rider picked up parcel from merchant (Pathao)'),
-            'picked_up': ('IN_TRANSIT', 'Rider picked up parcel from merchant (Pathao)'),
+            'order.picked_up': ('PICKED_UP', 'Rider picked up parcel from merchant (Pathao)'),
+            'picked_up': ('PICKED_UP', 'Rider picked up parcel from merchant (Pathao)'),
+            'pickup_requested': ('COURIER_CREATED', 'Pickup requested at Pathao hub'),
             'order.out_for_delivery': ('OUT_FOR_DELIVERY', 'Rider out for delivery to recipient (Pathao)'),
             'out_for_delivery': ('OUT_FOR_DELIVERY', 'Rider out for delivery to recipient (Pathao)'),
             'order.returned': ('RETURNED', 'Parcel returned to merchant (Pathao)'),
@@ -270,8 +385,9 @@ class SteadfastAdapter(BaseCourierAdapter):
                 data = resp.json() if resp.text else {}
                 if resp.status_code == 200 and data.get('status') == 200:
                     consignment = data.get('consignment', {})
-                    tracking_code = str(consignment.get('tracking_code') or '')
-                    consignment_id = str(consignment.get('consignment_id') or '')
+                    tracking_code = str(consignment.get('tracking_code') or consignment.get('consignment_id') or '')
+                    consignment_id = str(consignment.get('consignment_id') or tracking_code or '')
+                    rider_info = self.extract_rider_info(consignment if isinstance(consignment, dict) else data)
                     return {
                         'provider': 'steadfast',
                         'trackingId': tracking_code,
@@ -281,9 +397,9 @@ class SteadfastAdapter(BaseCourierAdapter):
                         'deliveryFee': delivery_fee,
                         'codAmount': cod_amount,
                         'trackingUrl': f"https://steadfast.com.bd/tracking/{tracking_code}",
-                        'hubLocation': 'Motijheel Central Distribution Hub' if is_dhaka else 'District Delivery Station',
-                        'assignedRiderName': 'Steadfast Delivery Executive',
-                        'assignedRiderPhone': '01811000000',
+                        'hubLocation': rider_info.get('hubLocation') or ('Motijheel Central Distribution Hub' if is_dhaka else 'District Delivery Station'),
+                        'assignedRiderName': rider_info.get('assignedRiderName', ''),
+                        'assignedRiderPhone': rider_info.get('assignedRiderPhone', ''),
                         'liveApi': True,
                     }
                 else:
@@ -357,16 +473,21 @@ class SteadfastAdapter(BaseCourierAdapter):
             return {'status': 500, 'message': str(e)}
 
     def parse_webhook(self, payload):
-        raw_status = str(payload.get('status') or payload.get('event') or '').lower().strip()
+        raw_status = str(
+            payload.get('status')
+            or payload.get('delivery_status')
+            or payload.get('event')
+            or ''
+        ).lower().strip()
         mapping = {
             'delivered': ('DELIVERED', 'Parcel successfully delivered to recipient (Steadfast)'),
             'partial_delivered': ('DELIVERED', 'Parcel partially delivered (Steadfast)'),
             'delivered_approval_pending': ('DELIVERED', 'Delivered, pending settlement approval (Steadfast)'),
             'cancelled': ('CANCELLED', 'Parcel booking cancelled (Steadfast)'),
-            'hold': ('ON_HOLD', 'Parcel temporarily held at Steadfast hub'),
+            'hold': ('IN_TRANSIT', 'Parcel temporarily held at Steadfast hub'),
             'in_review': ('COURIER_CREATED', 'Consignment created and under review (Steadfast)'),
             'pending': ('COURIER_CREATED', 'Awaiting rider pickup (Steadfast)'),
-            'picked_up': ('IN_TRANSIT', 'Rider picked up parcel from merchant hub (Steadfast)'),
+            'picked_up': ('PICKED_UP', 'Rider picked up parcel from merchant hub (Steadfast)'),
             'in_transit': ('IN_TRANSIT', 'Parcel in transit to destination hub (Steadfast)'),
             'out_for_delivery': ('OUT_FOR_DELIVERY', 'Delivery rider is out for delivery (Steadfast)'),
             'return': ('RETURNED', 'Parcel returned as recipient was unavailable'),
@@ -437,18 +558,19 @@ class RedxAdapter(BaseCourierAdapter):
                 data = resp.json() if resp.text else {}
                 if resp.status_code in [200, 201] and data.get('tracking_id'):
                     tracking_id = str(data.get('tracking_id'))
+                    rider_info = self.extract_rider_info(data)
                     return {
                         'provider': 'redx',
                         'trackingId': tracking_id,
-                        'consignmentId': tracking_id,
+                        'consignmentId': str(data.get('consignment_id') or tracking_id),
                         'courierStatus': 'Consignment Booked in RedX Network',
                         'createdDate': timezone.localtime().strftime('%Y-%m-%d %I:%M %p'),
                         'deliveryFee': delivery_fee,
                         'codAmount': cod_amount,
                         'trackingUrl': f"https://redx.com.bd/track/{tracking_id}",
-                        'hubLocation': 'Gazipur Central Fulfilment' if is_dhaka else 'Regional Logistics Node',
-                        'assignedRiderName': 'RedX Delivery Executive',
-                        'assignedRiderPhone': '01912000000',
+                        'hubLocation': rider_info.get('hubLocation') or ('Gazipur Central Fulfilment' if is_dhaka else 'Regional Logistics Node'),
+                        'assignedRiderName': rider_info.get('assignedRiderName', ''),
+                        'assignedRiderPhone': rider_info.get('assignedRiderPhone', ''),
                         'liveApi': True,
                     }
                 else:
@@ -525,11 +647,19 @@ class RedxAdapter(BaseCourierAdapter):
             return {'status': 500, 'message': str(e)}
 
     def parse_webhook(self, payload):
-        raw_status = str(payload.get('status') or payload.get('parcel_status') or payload.get('event') or '').lower().strip()
+        parcel = payload.get('parcel') if isinstance(payload.get('parcel'), dict) else {}
+        raw_status = str(
+            payload.get('status')
+            or payload.get('parcel_status')
+            or payload.get('event')
+            or parcel.get('status')
+            or ''
+        ).lower().strip()
         mapping = {
             'delivered': ('DELIVERED', 'Parcel successfully delivered to recipient (RedX)'),
             'in_transit': ('IN_TRANSIT', 'Parcel in RedX transit hub'),
-            'pickup_completed': ('IN_TRANSIT', 'RedX rider picked up parcel from merchant'),
+            'pickup_completed': ('PICKED_UP', 'RedX rider picked up parcel from merchant'),
+            'picked_up': ('PICKED_UP', 'RedX rider picked up parcel from merchant'),
             'out_for_delivery': ('OUT_FOR_DELIVERY', 'RedX rider out for delivery to recipient'),
             'returned_to_merchant': ('RETURNED', 'Parcel returned to merchant (RedX)'),
             'returned': ('RETURNED', 'Parcel returned to merchant (RedX)'),
@@ -607,18 +737,19 @@ class ECourierAdapter(BaseCourierAdapter):
                 data = resp.json() if resp.text else {}
                 if resp.status_code in [200, 201] and (data.get('success') or data.get('tracking_id') or data.get('ID')):
                     tracking_id = str(data.get('tracking_id') or data.get('ID') or data.get('id') or '')
+                    rider_info = self.extract_rider_info(data)
                     return {
                         'provider': 'ecourier',
                         'trackingId': tracking_id,
-                        'consignmentId': tracking_id,
+                        'consignmentId': str(data.get('consignment_id') or tracking_id),
                         'courierStatus': 'Manifested with eCourier',
                         'createdDate': timezone.localtime().strftime('%Y-%m-%d %I:%M %p'),
                         'deliveryFee': delivery_fee,
                         'codAmount': cod_amount,
                         'trackingUrl': f"https://ecourier.com.bd/track/{tracking_id}",
-                        'hubLocation': 'Kakrail Delivery Office',
-                        'assignedRiderName': 'eCourier Express Agent',
-                        'assignedRiderPhone': '01620000000',
+                        'hubLocation': rider_info.get('hubLocation') or 'Kakrail Delivery Office',
+                        'assignedRiderName': rider_info.get('assignedRiderName', ''),
+                        'assignedRiderPhone': rider_info.get('assignedRiderPhone', ''),
                         'liveApi': True,
                     }
                 else:
@@ -692,12 +823,43 @@ class ECourierAdapter(BaseCourierAdapter):
             return {'success': False, 'isDemo': False, 'message': str(e)}
 
     def check_status(self, tracking_code):
-        return {'status': 200, 'tracking_id': tracking_code, 'provider': 'ecourier'}
+        api_key, secret, user_id, _ = self.get_credentials()
+        if not api_key or api_key == 'ec_usr_849201' or secret in ['', 'ec_key_192837']:
+            return {'status': 200, 'tracking_id': tracking_code, 'provider': 'ecourier', 'isDemo': True}
+        try:
+            resp = requests.post(
+                f"{self.BASE_URL}/parcel-tracking",
+                json={"tracking": tracking_code},
+                headers={
+                    "API-KEY": api_key,
+                    "API-SECRET": secret,
+                    "USER-ID": user_id,
+                    "Content-Type": "application/json"
+                },
+                timeout=10
+            )
+            data = resp.json() if resp.text else {}
+            return {
+                'status': resp.status_code,
+                'provider': 'ecourier',
+                'tracking_id': tracking_code,
+                'parcel_status': data.get('status') or data.get('parcel_status') or '',
+                'raw': data,
+            }
+        except Exception as e:
+            return {'status': 500, 'message': str(e)}
 
     def parse_webhook(self, payload):
-        raw_status = str(payload.get('status') or payload.get('parcel_status') or payload.get('event') or '').lower().strip()
+        raw_status = str(
+            payload.get('status')
+            or payload.get('parcel_status')
+            or payload.get('event')
+            or ''
+        ).lower().strip()
         mapping = {
             'delivered': ('DELIVERED', 'Parcel successfully delivered via eCourier'),
+            'picked_up': ('PICKED_UP', 'Rider picked up parcel from merchant (eCourier)'),
+            'picked up': ('PICKED_UP', 'Rider picked up parcel from merchant (eCourier)'),
             'in-transit': ('IN_TRANSIT', 'Parcel in destination transit hub (eCourier)'),
             'in_transit': ('IN_TRANSIT', 'Parcel in destination transit hub (eCourier)'),
             'out for delivery': ('OUT_FOR_DELIVERY', 'eCourier rider out for delivery'),
