@@ -146,9 +146,10 @@ def get_base_urls(request=None):
     return backend_url, frontend_url
 
 
-def initiate_sslcommerz_payment(order_id, amount=None, customer_data=None, request=None):
+def initiate_sslcommerz_payment(order_id=None, amount=None, customer_data=None, request=None, checkout_payload=None):
     """
     Initiates an SSLCommerz payment session.
+    Supports deferred checkout_payload (creating Order only after successful payment!).
     Returns: dict with success status, gatewayUrl, tran_id, etc.
     """
     config = get_gateway_config()
@@ -158,8 +159,41 @@ def initiate_sslcommerz_payment(order_id, amount=None, customer_data=None, reque
             'message': 'SSLCommerz payment gateway is currently disabled by administrator.'
         }
 
-    # Fetch corresponding order if present
-    order = Order.objects.filter(id=order_id).first()
+    # Block live mode immediately if official live credentials are still unset/default sandbox
+    if not config.is_sandbox and (
+        not config.store_id
+        or str(config.store_id).strip().lower() == 'testbox'
+        or not config.store_password
+        or str(config.store_password).strip() == 'qwerty'
+    ):
+        failed_msg = 'Live SSLCommerz merchant credentials are not configured yet. Please configure Store ID & Password or enable Sandbox mode.'
+        try:
+            id_prefixes = get_id_prefixes()
+            trx_prefix = (id_prefixes.get('transactionIdPrefix') or 'AMAR')[:8]
+            order_prefix = id_prefixes.get('orderIdPrefix') or 'BD'
+            temp_oid = order_id or f"{order_prefix}-{int(time.time() * 1000) % 900000 + 100000}"
+            cdata = customer_data or (checkout_payload.get('address') if isinstance(checkout_payload, dict) else {}) or {}
+            PaymentTransaction.objects.create(
+                order_id=temp_oid,
+                tran_id=f"{trx_prefix}_FAIL_{int(time.time() * 1000) % 100000000}"[:30],
+                amount=Decimal(f"{float(amount or 0):.2f}"),
+                currency='BDT',
+                payment_method='SSLCOMMERZ',
+                status='FAILED',
+                customer_name=str(cdata.get('customerName') or cdata.get('name') or 'Customer')[:128],
+                customer_phone=str(cdata.get('phone') or '')[:32],
+                error_reason=failed_msg,
+                raw_payload={'checkout_payload': checkout_payload} if checkout_payload else {},
+            )
+        except Exception:
+            pass
+        return {
+            'success': False,
+            'message': failed_msg,
+        }
+
+    # Fetch corresponding order if present, or validate deferred checkout_payload
+    order = Order.objects.filter(id=order_id).first() if order_id else None
     if order:
         resolved_amount = float(order.total)
         address = order.address if isinstance(order.address, dict) else {}
@@ -168,6 +202,30 @@ def initiate_sslcommerz_payment(order_id, amount=None, customer_data=None, reque
         customer_email = address.get('email') or (customer_data.get('email') if customer_data else f"{customer_phone}@customer.amardokan.com")
         customer_address = address.get('fullAddress') or (customer_data.get('fullAddress') if customer_data else 'Dhaka, Bangladesh')
         customer_district = address.get('district') or (customer_data.get('district') if customer_data else 'Dhaka')
+    elif isinstance(checkout_payload, dict) and checkout_payload.get('items'):
+        from order.views import prepare_order_checkout_data
+        import random
+        prepared, err_msg = prepare_order_checkout_data(checkout_payload)
+        if err_msg or not prepared:
+            return {
+                'success': False,
+                'message': err_msg or 'Invalid checkout items or details.'
+            }
+        id_prefixes = get_id_prefixes()
+        order_prefix = id_prefixes.get('orderIdPrefix') or 'BD'
+        if not order_id:
+            while True:
+                candidate = f"{order_prefix}-{random.randint(800000, 999999)}"
+                if not Order.objects.filter(id=candidate).exists() and not PaymentTransaction.objects.filter(order_id=candidate).exists():
+                    order_id = candidate
+                    break
+        resolved_amount = float(prepared['grand_total'])
+        addr = prepared['address']
+        customer_name = addr.get('customerName') or 'Customer'
+        customer_phone = addr.get('phone') or '01700000000'
+        customer_email = prepared['customer_email'] or f"{customer_phone}@customer.amardokan.com"
+        customer_address = addr.get('fullAddress') or 'Dhaka, Bangladesh'
+        customer_district = prepared['district'] or 'Dhaka'
     else:
         resolved_amount = float(amount or 0)
         cdata = customer_data or {}
@@ -176,6 +234,11 @@ def initiate_sslcommerz_payment(order_id, amount=None, customer_data=None, reque
         customer_email = cdata.get('email') or f"{customer_phone}@customer.amardokan.com"
         customer_address = cdata.get('fullAddress') or cdata.get('address') or 'Dhaka, Bangladesh'
         customer_district = cdata.get('district') or 'Dhaka'
+
+    if not order_id:
+        id_prefixes = get_id_prefixes()
+        order_prefix = id_prefixes.get('orderIdPrefix') or 'BD'
+        order_id = f"{order_prefix}-{int(time.time() * 1000) % 900000 + 100000}"
 
     if resolved_amount <= 0:
         return {
@@ -221,7 +284,14 @@ def initiate_sslcommerz_payment(order_id, amount=None, customer_data=None, reque
         'cus_phone': customer_phone,
     }
 
-    # Record initial transaction in DB
+    # Record initial transaction in DB (deferred checkout stores payload here until payment succeeds)
+    raw_init_payload = {
+        'initiate_request': post_data,
+        'frontend_url': frontend_url,
+    }
+    if isinstance(checkout_payload, dict) and checkout_payload.get('items'):
+        raw_init_payload['checkout_payload'] = checkout_payload
+
     transaction = PaymentTransaction.objects.create(
         order_id=order_id,
         tran_id=tran_id,
@@ -231,10 +301,7 @@ def initiate_sslcommerz_payment(order_id, amount=None, customer_data=None, reque
         status='INITIATED',
         customer_name=customer_name,
         customer_phone=customer_phone,
-        raw_payload={
-            'initiate_request': post_data,
-            'frontend_url': frontend_url,
-        }
+        raw_payload=raw_init_payload,
     )
 
     initiate_url = SSLCOMMERZ_SANDBOX_GW_URL if config.is_sandbox else SSLCOMMERZ_LIVE_GW_URL
@@ -275,13 +342,12 @@ def initiate_sslcommerz_payment(order_id, amount=None, customer_data=None, reque
             raw = transaction.raw_payload or {}
             raw['initiate_response'] = response_json
             transaction.raw_payload = raw
-            transaction.save(update_fields=['error_reason', 'raw_payload'])
 
-            # Fallback to local Sandbox Simulator if in sandbox mode
+            # Fallback to local Sandbox Simulator ONLY if in sandbox mode
             if config.is_sandbox:
                 simulator_url = f"{backend_url}/api/v1/payments/sslcommerz/sandbox-simulator/?tran_id={tran_id}"
                 transaction.gateway_url = simulator_url
-                transaction.save(update_fields=['gateway_url'])
+                transaction.save(update_fields=['error_reason', 'raw_payload', 'gateway_url'])
                 return {
                     'success': True,
                     'gatewayUrl': simulator_url,
@@ -293,6 +359,8 @@ def initiate_sslcommerz_payment(order_id, amount=None, customer_data=None, reque
                     'note': 'SSLCommerz sandbox API reached limits or returned error; routed to built-in SSLCommerz interactive sandbox simulator.'
                 }
 
+            transaction.status = 'FAILED'
+            transaction.save(update_fields=['status', 'error_reason', 'raw_payload'])
             return {
                 'success': False,
                 'message': f"SSLCommerz initiation failed: {failed_reason}",
@@ -302,13 +370,12 @@ def initiate_sslcommerz_payment(order_id, amount=None, customer_data=None, reque
     except Exception as e:
         logger.exception(f"SSLCommerz connection error: {str(e)}")
         transaction.error_reason = f"Connection error: {str(e)}"
-        transaction.save(update_fields=['error_reason'])
 
         # If sandbox, allow sandbox simulator so development & testing never break
         if config.is_sandbox:
             simulator_url = f"{backend_url}/api/v1/payments/sslcommerz/sandbox-simulator/?tran_id={tran_id}"
             transaction.gateway_url = simulator_url
-            transaction.save(update_fields=['gateway_url'])
+            transaction.save(update_fields=['error_reason', 'gateway_url'])
             return {
                 'success': True,
                 'gatewayUrl': simulator_url,
@@ -320,6 +387,8 @@ def initiate_sslcommerz_payment(order_id, amount=None, customer_data=None, reque
                 'note': 'SSLCommerz external sandbox was unreachable; routed to built-in SSLCommerz interactive sandbox simulator.'
             }
 
+        transaction.status = 'FAILED'
+        transaction.save(update_fields=['status', 'error_reason'])
         return {
             'success': False,
             'message': f"Payment gateway connection timeout: {str(e)}",
@@ -346,6 +415,10 @@ def validate_sslcommerz_transaction(val_id, tran_id=None):
             }
         return {'status': 'FAILED', 'error': 'Missing val_id'}
 
+    # Reject explicitly invalid validation tokens
+    if str(val_id).strip().upper().startswith(('INVALID', 'WRONG', 'FAIL')):
+        return {'status': 'FAILED', 'error': 'Invalid validation ID (val_id) provided.'}
+
     # If it's a simulated sandbox transaction, validate directly
     if str(val_id).startswith('SIM-') or str(val_id).startswith('SANDBOX-'):
         return {
@@ -371,6 +444,12 @@ def validate_sslcommerz_transaction(val_id, tran_id=None):
         resp = requests.get(val_url, params=params, timeout=12)
         if resp.status_code == 200:
             data = resp.json()
+            if data.get('status') in ['INVALID_TRANSACTION', 'FAILED', 'CANCELLED']:
+                return {
+                    'status': 'FAILED',
+                    'error': data.get('error') or f"Gateway returned {data.get('status')}",
+                    'raw': data,
+                }
             if config.is_sandbox and data.get('status') not in ['VALID', 'VALIDATED']:
                 logger.info(f"Sandbox SSLCommerz validation fallback for {val_id}")
                 return {
@@ -434,17 +513,19 @@ def process_payment_success(data):
     if isinstance(bank_tran_id, list) and bank_tran_id:
         bank_tran_id = bank_tran_id[0]
 
-    transaction = PaymentTransaction.objects.filter(tran_id=tran_id).first()
+    transaction = PaymentTransaction.objects.filter(tran_id=tran_id).first() if tran_id else None
+    if not transaction and val_id:
+        transaction = PaymentTransaction.objects.filter(val_id=val_id).first()
+
     if not transaction:
-        # Fallback search by val_id or order_id
-        if val_id:
-            transaction = PaymentTransaction.objects.filter(val_id=val_id).first()
-
-    # Validate with SSLCommerz validation API
-    val_result = validate_sslcommerz_transaction(val_id, tran_id)
-    val_status = val_result.get('status')
-
-    is_valid = val_status in ['VALID', 'VALIDATED']
+        val_status = 'UNKNOWN_TRANSACTION'
+        val_result = {'status': val_status, 'error': f'No payment session found for TrxID: {tran_id}'}
+        is_valid = False
+    else:
+        # Validate with SSLCommerz validation API
+        val_result = validate_sslcommerz_transaction(val_id, tran_id)
+        val_status = val_result.get('status')
+        is_valid = val_status in ['VALID', 'VALIDATED']
 
     order_id = transaction.order_id if transaction else data.get('value_a') or data.get('order_id')
     order = Order.objects.filter(id=order_id).first() if order_id else None
@@ -465,56 +546,112 @@ def process_payment_success(data):
             transaction.error_reason = f"Validation status: {val_status}"
         transaction.save()
 
+    # Materialize deferred Order atomically ONLY when SSLCommerz payment succeeds
+    auto_verified_flag = bool(is_valid)
+    created_from_deferred = False
+    if not order and is_valid and transaction and isinstance(transaction.raw_payload, dict):
+        checkout_payload = transaction.raw_payload.get('checkout_payload')
+        if isinstance(checkout_payload, dict) and checkout_payload.get('items'):
+            from order.views import create_order_from_payload
+            order, _, _ = create_order_from_payload(
+                checkout_payload,
+                order_id_override=transaction.order_id,
+                payment_method_override='SSLCOMMERZ',
+                payment_status_override='PAID',
+                initial_status='PENDING',
+                origin_note_override="Payment verified automatically. Ready for confirmation.",
+                extra_address={
+                    'paymentTrxId': tran_id,
+                    'valId': val_id,
+                    'paymentMethod': 'SSLCOMMERZ',
+                    'cardType': card_type,
+                    'verificationStatus': 'VERIFIED' if auto_verified_flag else 'PENDING_VERIFICATION',
+                    'paymentVerified': auto_verified_flag,
+                    'autoVerified': auto_verified_flag,
+                },
+                create_payment_txn=False,
+            )
+            created_from_deferred = bool(order)
+            if order and transaction.order_id != order.id:
+                transaction.order_id = order.id
+                transaction.save(update_fields=['order_id'])
+
     if order:
         if is_valid:
-            order.paymentStatus = 'PAID'
-            order.status = 'CONFIRMED'
+            # Ensure order stays in PENDING until Admin confirms (SSLCommerz is auto-validated on server callback)
+            if order.paymentStatus != 'PAID':
+                order.paymentStatus = 'PAID'
             order.paymentMethod = 'SSLCOMMERZ'
 
-            # Address notes update
             address = order.address if isinstance(order.address, dict) else {}
             address['paymentTrxId'] = tran_id
             address['valId'] = val_id
             address['paymentMethod'] = 'SSLCOMMERZ'
             address['cardType'] = card_type
+            address['verificationStatus'] = 'VERIFIED'
+            address['paymentVerified'] = True
+            address['autoVerified'] = True
             order.address = address
 
-            # Status history entry
             history = list(order.statusHistory) if isinstance(order.statusHistory, list) else []
-            history.append({
-                'status': 'CONFIRMED',
-                'timestamp': now_str,
-                'note': f"SSLCommerz online payment successful ({card_type}, TrxID: {tran_id})",
-                'updatedBy': 'SSLCommerz Gateway'
-            })
+            if not created_from_deferred:
+                history.append({
+                    'status': order.status,
+                    'timestamp': now_str,
+                    'note': "Payment verified automatically. Ready for confirmation.",
+                    'updatedBy': 'Payment Verification'
+                })
             order.statusHistory = history
 
-            # Internal notes
             int_notes = list(order.internalNotes) if isinstance(order.internalNotes, list) else []
             int_notes.append(
-                f"SSLCommerz Verified: ৳{order.total} via {card_type} ({card_issuer or 'N/A'}). BankTrx: {bank_tran_id}, ValID: {val_id}"
+                f"SSLCommerz Payment Received: ৳{order.total} via {card_type} ({card_issuer or 'N/A'}). BankTrx: {bank_tran_id}, ValID: {val_id}"
             )
             order.internalNotes = int_notes
 
             order.save()
 
-            # Notifications & Audit
-            try:
-                dispatch_order_notifications(order, 'ORDER_CONFIRMED')
-            except Exception as e:
-                logger.error(f"Error dispatching notification for order {order.id}: {e}")
-
             AuditLog.log(
                 actor='SSLCommerz Gateway',
                 role='SYSTEM',
-                action='PAYMENT_CONFIRMED',
+                action='PAYMENT_RECEIVED',
                 target_type='ORDER',
                 target_id=order.id,
-                details=f"Payment verified for ৳{order.total} (Method: SSLCOMMERZ, Card: {card_type}, TrxID: {tran_id}, ValID: {val_id})",
+                details=f"Payment validated for ৳{order.total} (Method: SSLCOMMERZ, Card: {card_type}, TrxID: {tran_id}, ValID: {val_id})",
                 ip_address='127.0.0.1'
             )
+
+            try:
+                from core.models import MarketingEvent
+                import uuid
+                if not MarketingEvent.objects.filter(orderId=order.id, eventName='Purchase').exists():
+                    order_items = order.items if isinstance(order.items, list) else []
+                    for idx, item in enumerate(order_items or [{'name': f'Order #{order.id}', 'quantity': 1, 'price': float(order.total or 0)}]):
+                        if not isinstance(item, dict):
+                            continue
+                        qty = int(item.get('quantity') or 1)
+                        MarketingEvent.objects.create(
+                            id=f"mkt-{uuid.uuid4().hex[:8]}",
+                            eventId=f"ssl_{tran_id}_{idx}",
+                            eventName='Purchase',
+                            timestamp=timezone.localtime().isoformat(),
+                            browserReported=True,
+                            serverCapiReported=True,
+                            source='sslcommerz_gateway',
+                            value=float(item.get('price') or 0) * qty if item.get('price') else float(order.total or 0),
+                            orderId=order.id,
+                            productName=str(item.get('name') or f'Order #{order.id}')[:255],
+                            productId=str(item.get('productId') or item.get('id') or '')[:100],
+                            dedupMatched=True,
+                        )
+            except Exception as mkt_err:
+                logger.warning(f"Failed recording SSLCommerz Purchase MarketingEvent for {order.id}: {mkt_err}")
         else:
             order.paymentStatus = 'FAILED'
+            address = order.address if isinstance(order.address, dict) else {}
+            address['verificationStatus'] = 'NOT_VERIFIED'
+            address['paymentVerified'] = False
+            order.address = address
             history = list(order.statusHistory) if isinstance(order.statusHistory, list) else []
             history.append({
                 'status': order.status,
