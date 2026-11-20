@@ -74,6 +74,9 @@ def assign_courier(request):
 
     try:
         shipment = adapter.create_shipment(order, item_weight_kg=weight_kg, special_instruction=special_instruction)
+        cod_amt = int(shipment.get('codAmount') or 0)
+        if cod_amt > 0:
+            shipment['codAccounted'] = True
 
         order.courier = shipment
         order.status = requested_status
@@ -83,11 +86,17 @@ def assign_courier(request):
         history.append({
             'status': requested_status,
             'timestamp': now_str,
-            'note': f"Dispatched directly to {adapter.name}. Consignment: {shipment['consignmentId']}, Tracking ID: {shipment['trackingId']}",
+            'note': f"Dispatched directly to {adapter.name}.",
             'updatedBy': actor_name,
         })
         order.statusHistory = history
         order.save()
+
+        if courier_config:
+            if cod_amt > 0:
+                courier_config.pendingCodAmount = max(0, int(courier_config.pendingCodAmount or 0) + cod_amt)
+            courier_config.lastSyncTime = timezone.localtime().strftime('%I:%M %p')
+            courier_config.save(update_fields=['pendingCodAmount', 'lastSyncTime'])
 
         # Notify customer
         dispatch_order_notifications(order, 'SHIPMENT_CREATED')
@@ -195,27 +204,55 @@ def process_courier_webhook_data(data, ip_address='127.0.0.1'):
 
     prev_status = order.status
     order.status = parsed['orderStatus']
-    
+
     courier_dict = dict(order.courier) if isinstance(order.courier, dict) else {}
     courier_dict['courierStatus'] = parsed['notes']
-    order.courier = courier_dict
+    rider_info = adapter.extract_rider_info(data)
+    if rider_info.get('assignedRiderName'):
+        courier_dict['assignedRiderName'] = rider_info['assignedRiderName']
+    if rider_info.get('assignedRiderPhone'):
+        courier_dict['assignedRiderPhone'] = rider_info['assignedRiderPhone']
+    if rider_info.get('hubLocation'):
+        courier_dict['hubLocation'] = rider_info['hubLocation']
+    if tracking_val:
+        courier_dict['trackingId'] = tracking_val
+    if consignment_val:
+        courier_dict['consignmentId'] = consignment_val
 
+    courier_cfg = CourierConfig.objects.filter(id=adapter.provider_id).first()
     if parsed['orderStatus'] == 'DELIVERED':
         order.paymentStatus = 'PAID'
-        dispatch_order_notifications(order, 'DELIVERED')
-    elif parsed['orderStatus'] == 'OUT_FOR_DELIVERY':
+        if not courier_dict.get('codSettled'):
+            cod_val = int(parsed.get('collectedAmount') or courier_dict.get('codAmount') or 0)
+            if cod_val > 0 and courier_cfg:
+                if courier_dict.get('codAccounted'):
+                    courier_cfg.pendingCodAmount = max(0, int(courier_cfg.pendingCodAmount or 0) - cod_val)
+                courier_cfg.settledCodAmount = int(courier_cfg.settledCodAmount or 0) + cod_val
+            courier_dict['codSettled'] = True
+            courier_dict['collectedAmount'] = cod_val
+        if prev_status != 'DELIVERED':
+            dispatch_order_notifications(order, 'DELIVERED')
+    elif parsed['orderStatus'] == 'OUT_FOR_DELIVERY' and prev_status != 'OUT_FOR_DELIVERY':
         dispatch_order_notifications(order, 'OUT_FOR_DELIVERY')
+
+    order.courier = courier_dict
 
     now_str = timezone.localtime().strftime('%Y-%m-%d %H:%M:%S')
     history = list(order.statusHistory) if isinstance(order.statusHistory, list) else []
-    history.append({
-        'status': parsed['orderStatus'],
-        'timestamp': now_str,
-        'note': parsed['notes'],
-        'updatedBy': f"Courier Webhook ({adapter.name})",
-    })
+    last_entry = history[-1] if history and isinstance(history[-1], dict) else None
+    if not (last_entry and last_entry.get('status') == parsed['orderStatus'] and last_entry.get('note') == parsed['notes']):
+        history.append({
+            'status': parsed['orderStatus'],
+            'timestamp': now_str,
+            'note': parsed['notes'],
+            'updatedBy': f"Courier Webhook ({adapter.name})",
+        })
     order.statusHistory = history
     order.save()
+
+    if courier_cfg:
+        courier_cfg.lastSyncTime = timezone.localtime().strftime('%I:%M %p')
+        courier_cfg.save(update_fields=['pendingCodAmount', 'settledCodAmount', 'lastSyncTime'])
 
     AuditLog.log(
         actor=f"{adapter.name} Webhook",
@@ -272,3 +309,68 @@ def courier_webhook(request):
     result = process_courier_webhook_data(data, ip_address=request.META.get('REMOTE_ADDR', '127.0.0.1'))
     status_code = result.pop('status_code', status.HTTP_200_OK)
     return Response(result, status=status_code)
+
+
+@api_view(['POST'])
+@permission_classes([AllowAny])
+def sync_order_courier_status(request, order_id):
+    """Actively poll the assigned live courier API and sync Order + Rider + COD settlement status."""
+    order = Order.objects.filter(id=order_id).first()
+    if not order or not isinstance(order.courier, dict) or not order.courier.get('trackingId'):
+        return Response({
+            'success': False,
+            'message': 'Order or assigned courier tracking ID not found.'
+        }, status=status.HTTP_404_NOT_FOUND)
+
+    provider = str(order.courier.get('provider') or '').strip().lower()
+    adapter = courier_adapters.get(provider)
+    if not adapter:
+        return Response({
+            'success': False,
+            'message': f"Unsupported courier provider: {provider}"
+        }, status=status.HTTP_400_BAD_REQUEST)
+
+    tracking_code = order.courier.get('consignmentId') if provider == 'pathao' else order.courier.get('trackingId')
+    live_res = adapter.check_status(tracking_code or order.courier.get('trackingId'))
+    if not isinstance(live_res, dict) or live_res.get('status') == 500 or live_res.get('status') == 401:
+        return Response({
+            'success': False,
+            'message': live_res.get('message') if isinstance(live_res, dict) else 'Courier status fetch failed',
+            'raw': live_res,
+        }, status=status.HTTP_400_BAD_REQUEST)
+
+    if live_res.get('isDemo'):
+        return Response({
+            'success': True,
+            'isDemo': True,
+            'message': 'Sandbox/Demo courier active. Connect live API credentials or use Webhook Simulator to advance status.',
+            'order': OrderSerializer(order).data,
+        })
+
+    raw_payload = dict(live_res.get('raw') or live_res)
+    raw_payload['provider'] = provider
+    raw_payload['order_id'] = order.id
+    raw_payload['tracking_id'] = order.courier.get('trackingId')
+
+    raw_status_text = str(
+        raw_payload.get('delivery_status')
+        or raw_payload.get('order_status')
+        or raw_payload.get('parcel_status')
+        or raw_payload.get('status')
+        or (raw_payload.get('data', {}).get('order_status') if isinstance(raw_payload.get('data'), dict) else '')
+        or (raw_payload.get('parcel', {}).get('status') if isinstance(raw_payload.get('parcel'), dict) else '')
+        or ''
+    ).strip()
+
+    if raw_status_text and raw_status_text not in ('200', '201'):
+        raw_payload['status'] = raw_status_text
+        res = process_courier_webhook_data(raw_payload, ip_address=request.META.get('REMOTE_ADDR', '127.0.0.1'))
+        res.pop('status_code', None)
+        return Response(res)
+
+    return Response({
+        'success': True,
+        'message': 'Checked live courier API; parcel status unchanged.',
+        'order': OrderSerializer(order).data,
+        'raw': live_res,
+    })
