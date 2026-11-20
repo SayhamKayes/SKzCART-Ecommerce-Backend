@@ -1,5 +1,6 @@
 from django.urls import path
 from . import views
+from . import meta_ads_views
 
 urlpatterns = [
     path('health', views.health_check, name='health_check'),
@@ -13,6 +14,23 @@ urlpatterns = [
     path('marketing/events', views.marketing_events_view, name='marketing_events'),
     path('marketing/sync-meta-ads', views.sync_meta_ads_view, name='sync_meta_ads'),
     path('marketing/facebook-catalog.xml', views.facebook_catalog_feed_view, name='facebook_catalog_feed'),
+    # Multi-Tenant SaaS Meta Ads & Boost Endpoints
+    path('marketing/tenants', meta_ads_views.marketing_tenants_view, name='marketing_tenants'),
+    path('marketing/meta/connection', meta_ads_views.meta_connection_view, name='meta_connection'),
+    path('marketing/meta/oauth/url', meta_ads_views.meta_oauth_url_view, name='meta_oauth_url'),
+    path('marketing/meta/oauth/exchange', meta_ads_views.meta_oauth_exchange_view, name='meta_oauth_exchange'),
+    path('marketing/meta/connect-token', meta_ads_views.meta_connect_token_view, name='meta_connect_token'),
+    path('marketing/meta/select-assets', meta_ads_views.meta_select_assets_view, name='meta_select_assets'),
+    path('marketing/meta/account-health', meta_ads_views.meta_account_health_view, name='meta_account_health'),
+    path('marketing/meta/page-posts', meta_ads_views.meta_page_posts_view, name='meta_page_posts'),
+    path('marketing/meta/targeting/search', meta_ads_views.meta_targeting_search_view, name='meta_targeting_search'),
+    path('marketing/meta/targeting/reach-estimate', meta_ads_views.meta_reach_estimate_view, name='meta_reach_estimate'),
+    path('marketing/meta/campaigns', meta_ads_views.meta_campaigns_list_view, name='meta_campaigns_list'),
+    path('marketing/meta/campaigns/launch', meta_ads_views.meta_campaign_launch_view, name='meta_campaign_launch'),
+    path('marketing/meta/campaigns/<str:pk>/status', meta_ads_views.meta_campaign_status_view, name='meta_campaign_status'),
+    path('marketing/meta/campaigns/<str:pk>', meta_ads_views.meta_campaign_delete_view, name='meta_campaign_delete'),
+    path('marketing/meta/adsets/<str:pk>', meta_ads_views.meta_adset_update_view, name='meta_adset_update'),
+    path('marketing/meta/sync', meta_ads_views.meta_sync_two_way_view, name='meta_sync_two_way'),
     path('notifications', views.notifications_list, name='notifications'),
     path('settings/shop', views.shop_settings_view, name='shop_settings'),
     path('settings/shop/', views.shop_settings_view, name='shop_settings_slash'),
