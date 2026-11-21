@@ -496,7 +496,13 @@ def estimate_audience_reach(access_token: str, ad_account_id: str, targeting_inp
     }
 
 
-def upload_ad_image(access_token: str, ad_account_id: str, image_url: str, public_origin: str = "") -> tuple[bool, str]:
+def upload_ad_image(
+    access_token: str,
+    ad_account_id: str,
+    image_url: str,
+    public_origin: str = "",
+    backend_origin: str = "",
+) -> tuple[bool, str]:
     """
     Uploads a local /media image or remote HTTP image to Meta /{ad_account_id}/adimages
     and returns the resulting Meta image_hash.
@@ -521,8 +527,10 @@ def upload_ad_image(access_token: str, ad_account_id: str, image_url: str, publi
 
     if img_bytes is None:
         fetch_url = clean_url
-        if not fetch_url.startswith(("http://", "https://")) and public_origin:
-            fetch_url = f"{public_origin.rstrip('/')}/{fetch_url.lstrip('/')}"
+        if not fetch_url.startswith(("http://", "https://")):
+            preferred_origin = backend_origin if rel_path.startswith("/media/") and backend_origin else (public_origin or backend_origin)
+            if preferred_origin:
+                fetch_url = f"{preferred_origin.rstrip('/')}/{fetch_url.lstrip('/')}"
         try:
             dl = requests.get(fetch_url, timeout=12)
             if dl.status_code == 200 and dl.content:
@@ -546,7 +554,13 @@ def upload_ad_image(access_token: str, ad_account_id: str, image_url: str, publi
     return False, "Meta did not return an image_hash from adimages upload."
 
 
-def launch_meta_campaign_flow(connection, access_token: str, payload: dict, public_origin: str = "") -> tuple[bool, dict]:
+def launch_meta_campaign_flow(
+    connection,
+    access_token: str,
+    payload: dict,
+    public_origin: str = "",
+    backend_origin: str = "",
+) -> tuple[bool, dict]:
     """
     Executes the full 4-step Meta Marketing API campaign creation / Quick Boost flow:
       1. Campaign -> 2. AdSet -> 3. Image Upload & AdCreative (or Post Boost object_story_id) -> 4. Ad
@@ -662,7 +676,13 @@ def launch_meta_campaign_flow(connection, access_token: str, payload: dict, publ
             return False, {"stage": "CREATIVE", "message": "Landing / Product URL is required for product ads."}
 
         if image_url:
-            ok_img, hash_or_err = upload_ad_image(access_token, act_id, image_url, public_origin=public_origin)
+            ok_img, hash_or_err = upload_ad_image(
+                access_token,
+                act_id,
+                image_url,
+                public_origin=public_origin,
+                backend_origin=backend_origin,
+            )
             if not ok_img:
                 _meta_post(f"/{meta_campaign_id}", access_token, {"status": "DELETED"})
                 return False, {"stage": "IMAGE_UPLOAD", "message": hash_or_err}
