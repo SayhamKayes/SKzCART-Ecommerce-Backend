@@ -8,8 +8,8 @@ import os
 import time
 import uuid
 
-from .models import AuditLog, MarketingEvent, NotificationLog, MarketingConfig, ShopSetting, StaffMember, RecycleBinItem
-from .serializers import AuditLogSerializer, MarketingEventSerializer, NotificationLogSerializer, MarketingConfigSerializer, ShopSettingSerializer, StaffMemberSerializer, RecycleBinItemSerializer
+from .models import AuditLog, MarketingEvent, NotificationLog, MarketingConfig, ShopSetting, StaffMember, RecycleBinItem, MarketingUtmCampaign
+from .serializers import AuditLogSerializer, MarketingEventSerializer, NotificationLogSerializer, MarketingConfigSerializer, ShopSettingSerializer, StaffMemberSerializer, RecycleBinItemSerializer, MarketingUtmCampaignSerializer
 from .recycle_bin import (
     move_to_recycle_bin,
     snapshot_staff,
@@ -751,11 +751,97 @@ def sync_meta_ads_view(request):
             return Response({'success': False, 'message': str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
     return Response({
+        'success': False,
+        'synced': False,
+        'message': 'Meta Ad Account ID and Access Token are required to sync live campaign metrics.'
+    }, status=status.HTTP_400_BAD_REQUEST)
+
+
+@api_view(['GET', 'POST'])
+@permission_classes([AllowAny])
+def marketing_utm_campaigns_view(request):
+    """List or create DB-persisted custom UTM tracking campaigns."""
+    if request.method == 'GET':
+        campaigns = MarketingUtmCampaign.objects.all()
+        return Response({
+            'success': True,
+            'campaigns': MarketingUtmCampaignSerializer(campaigns, many=True).data,
+        })
+
+    data = request.data or {}
+    name = str(data.get('name') or '').strip()
+    if not name:
+        return Response({'success': False, 'message': 'Campaign name is required.'}, status=status.HTTP_400_BAD_REQUEST)
+
+    source = str(data.get('source') or 'facebook').strip().lower() or 'facebook'
+    product_id = str(data.get('productId') or 'all').strip() or 'all'
+    product_name = str(data.get('productName') or 'Entire Store Catalog').strip() or 'Entire Store Catalog'
+    utm_slug = str(data.get('utmCampaign') or '').strip()
+    if not utm_slug:
+        import re
+        utm_slug = re.sub(r'[^a-z0-9]+', '_', name.lower()).strip('_') or 'campaign'
+
+    camp = MarketingUtmCampaign.objects.create(
+        id=f"utm-{uuid.uuid4().hex[:10]}",
+        name=name[:255],
+        source=source[:64],
+        productId=product_id[:100],
+        productName=product_name[:255],
+        utmCampaign=utm_slug[:150],
+        landingUrl=str(data.get('landingUrl') or '').strip(),
+        spend=max(0.0, float(data.get('spend') or 0)),
+        clicks=max(0, int(data.get('clicks') or 0)),
+        isPaused=bool(data.get('isPaused', False)),
+    )
+    AuditLog.log(
+        actor='Admin',
+        role='MARKETING',
+        action='CREATE_UTM_CAMPAIGN',
+        target_type='MARKETING',
+        target_id=camp.id,
+        details=f"Created UTM tracking campaign '{camp.name}' ({camp.source})",
+        ip_address=request.META.get('REMOTE_ADDR', '127.0.0.1'),
+    )
+    return Response({
         'success': True,
-        'synced': True,
-        'simulation': True,
-        'message': "Ad metrics live synced with local store orders & ROAS matrix."
-    })
+        'campaign': MarketingUtmCampaignSerializer(camp).data,
+    }, status=status.HTTP_201_CREATED)
+
+
+@api_view(['PATCH', 'DELETE'])
+@permission_classes([AllowAny])
+def marketing_utm_campaign_detail_view(request, pk):
+    """Pause/resume, edit, or delete a DB-persisted custom UTM campaign."""
+    camp = MarketingUtmCampaign.objects.filter(id=pk).first()
+    if not camp:
+        return Response({'success': False, 'message': 'UTM campaign not found.'}, status=status.HTTP_404_NOT_FOUND)
+
+    if request.method == 'DELETE':
+        camp_name = camp.name
+        camp.delete()
+        AuditLog.log(
+            actor='Admin',
+            role='MARKETING',
+            action='DELETE_UTM_CAMPAIGN',
+            target_type='MARKETING',
+            target_id=pk,
+            details=f"Deleted UTM tracking campaign '{camp_name}'",
+            ip_address=request.META.get('REMOTE_ADDR', '127.0.0.1'),
+        )
+        return Response({'success': True, 'deletedId': pk})
+
+    data = request.data or {}
+    for field in ['name', 'source', 'productId', 'productName', 'utmCampaign', 'landingUrl']:
+        if field in data and data[field] is not None:
+            setattr(camp, field, str(data[field]).strip())
+    if 'spend' in data and data['spend'] is not None:
+        camp.spend = max(0.0, float(data['spend']))
+    if 'clicks' in data and data['clicks'] is not None:
+        camp.clicks = max(0, int(data['clicks']))
+    if 'isPaused' in data:
+        camp.isPaused = bool(data['isPaused'])
+    camp.save()
+    return Response({'success': True, 'campaign': MarketingUtmCampaignSerializer(camp).data})
 
 def facebook_catalog_feed_view(request):
     """
