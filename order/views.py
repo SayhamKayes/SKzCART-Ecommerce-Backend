@@ -43,7 +43,8 @@ def prepare_order_checkout_data(data):
         subtotal += int(unit_price) * int(item.get('quantity', 1))
 
     district = address.get('district', '')
-    delivery_calc = calculate_delivery_fee(district, address.get('fullAddress', ''))
+    area_hint = address.get('thana') or address.get('fullAddress', '')
+    delivery_calc = calculate_delivery_fee(district, area_hint, subtotal=subtotal)
     delivery_fee = delivery_calc['deliveryFee']
     address['deliveryZone'] = delivery_calc['deliveryZone']
 
