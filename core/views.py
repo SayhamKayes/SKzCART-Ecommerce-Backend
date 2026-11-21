@@ -348,7 +348,14 @@ def marketing_config_view(request):
 
     if request.method == 'GET':
         serializer = MarketingConfigSerializer(config)
-        return Response({'success': True, 'config': serializer.data})
+        cfg_data = dict(serializer.data)
+        if not cfg_data.get('pixelId') and os.getenv('META_PIXEL_ID', '').strip():
+            cfg_data['pixelId'] = os.getenv('META_PIXEL_ID', '').strip()
+        if not cfg_data.get('capiToken') and os.getenv('META_CAPI_TOKEN', '').strip():
+            cfg_data['capiToken'] = os.getenv('META_CAPI_TOKEN', '').strip()
+        if not cfg_data.get('testEventCode') and os.getenv('META_TEST_EVENT_CODE', '').strip():
+            cfg_data['testEventCode'] = os.getenv('META_TEST_EVENT_CODE', '').strip()
+        return Response({'success': True, 'config': cfg_data})
 
     data = request.data
     config.pixelId = data.get('pixelId', config.pixelId)
@@ -762,6 +769,7 @@ def facebook_catalog_feed_view(request):
     try:
         prods = Product.objects.all()
         host = request.build_absolute_uri('/')[:-1]
+        frontend_host = (os.getenv('FRONTEND_URL') or os.getenv('APP_URL') or host).rstrip('/')
 
         items_xml = []
         for p in prods:
@@ -773,11 +781,12 @@ def facebook_catalog_feed_view(request):
                 elif isinstance(first_img, dict):
                     image_url = first_img.get('url', '')
             if not image_url:
-                image_url = f"{host}/assets/default-product-placeholder.png"
+                image_url = f"{frontend_host}/assets/default-product-placeholder.png"
             if not image_url.startswith('http'):
-                image_url = f"{host}{image_url}"
+                img_base = host if image_url.startswith('/media/') else frontend_host
+                image_url = f"{img_base}{image_url if image_url.startswith('/') else '/' + image_url}"
 
-            link = f"{host}/campaign-products?product={p.id}&utm_source=facebook&utm_campaign=catalog_feed"
+            link = f"{frontend_host}/campaign-products?product={p.id}&utm_source=facebook&utm_campaign=catalog_feed"
             availability = 'out of stock' if p.isOutOfStock or p.stock <= 0 else 'in stock'
             desc = p.shortDescription or p.description or p.name
 
