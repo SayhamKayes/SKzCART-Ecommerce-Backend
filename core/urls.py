@@ -13,6 +13,8 @@ urlpatterns = [
     path('marketing/capi/event', views.marketing_capi_event_view, name='marketing_capi_event'),
     path('marketing/events', views.marketing_events_view, name='marketing_events'),
     path('marketing/sync-meta-ads', views.sync_meta_ads_view, name='sync_meta_ads'),
+    path('marketing/utm-campaigns', views.marketing_utm_campaigns_view, name='marketing_utm_campaigns'),
+    path('marketing/utm-campaigns/<str:pk>', views.marketing_utm_campaign_detail_view, name='marketing_utm_campaign_detail'),
     path('marketing/facebook-catalog.xml', views.facebook_catalog_feed_view, name='facebook_catalog_feed'),
     # Multi-Tenant SaaS Meta Ads & Boost Endpoints
     path('marketing/tenants', meta_ads_views.marketing_tenants_view, name='marketing_tenants'),
