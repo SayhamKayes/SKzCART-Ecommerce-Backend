@@ -220,6 +220,28 @@ class StaffMember(models.Model):
     class Meta:
         ordering = ['created_at']
 
+
+class MarketingUtmCampaign(models.Model):
+    """DB-persisted Custom UTM & Product Funnel Tracking Campaigns (replaces localStorage state)."""
+    id = models.CharField(max_length=64, primary_key=True)
+    name = models.CharField(max_length=255)
+    source = models.CharField(max_length=64, default='facebook')
+    productId = models.CharField(max_length=100, blank=True, default='all')
+    productName = models.CharField(max_length=255, blank=True, default='Entire Store Catalog')
+    utmCampaign = models.CharField(max_length=150, blank=True, default='')
+    landingUrl = models.TextField(blank=True, default='')
+    spend = models.FloatField(default=0)
+    clicks = models.IntegerField(default=0)
+    isPaused = models.BooleanField(default=False)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ['-created_at']
+
+    def __str__(self):
+        return f"{self.name} ({self.source})"
+
     def __str__(self):
         return f"{self.name} (@{self.username}) - {self.role}"
 
@@ -317,6 +339,28 @@ class StoreTenant(models.Model):
 
     class Meta:
         ordering = ['created_at']
+
+
+class MarketingUtmCampaign(models.Model):
+    """DB-persisted Custom UTM & Product Funnel Tracking Campaigns (replaces localStorage state)."""
+    id = models.CharField(max_length=64, primary_key=True)
+    name = models.CharField(max_length=255)
+    source = models.CharField(max_length=64, default='facebook')
+    productId = models.CharField(max_length=100, blank=True, default='all')
+    productName = models.CharField(max_length=255, blank=True, default='Entire Store Catalog')
+    utmCampaign = models.CharField(max_length=150, blank=True, default='')
+    landingUrl = models.TextField(blank=True, default='')
+    spend = models.FloatField(default=0)
+    clicks = models.IntegerField(default=0)
+    isPaused = models.BooleanField(default=False)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ['-created_at']
+
+    def __str__(self):
+        return f"{self.name} ({self.source})"
 
     def __str__(self):
         return f"{self.storeName} ({self.tenantId})"
@@ -474,6 +518,28 @@ class SaaSAdSet(models.Model):
         ordering = ['created_at']
 
 
+class MarketingUtmCampaign(models.Model):
+    """DB-persisted Custom UTM & Product Funnel Tracking Campaigns (replaces localStorage state)."""
+    id = models.CharField(max_length=64, primary_key=True)
+    name = models.CharField(max_length=255)
+    source = models.CharField(max_length=64, default='facebook')
+    productId = models.CharField(max_length=100, blank=True, default='all')
+    productName = models.CharField(max_length=255, blank=True, default='Entire Store Catalog')
+    utmCampaign = models.CharField(max_length=150, blank=True, default='')
+    landingUrl = models.TextField(blank=True, default='')
+    spend = models.FloatField(default=0)
+    clicks = models.IntegerField(default=0)
+    isPaused = models.BooleanField(default=False)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ['-created_at']
+
+    def __str__(self):
+        return f"{self.name} ({self.source})"
+
+
 class SaaSAdCreativeAd(models.Model):
     """Tenant-isolated Meta Creative & Ad node with policy review feedback."""
     id = models.CharField(max_length=64, primary_key=True)
@@ -506,5 +572,27 @@ class SaaSAdCreativeAd(models.Model):
 
     class Meta:
         ordering = ['created_at']
+
+
+class MarketingUtmCampaign(models.Model):
+    """DB-persisted Custom UTM & Product Funnel Tracking Campaigns (replaces localStorage state)."""
+    id = models.CharField(max_length=64, primary_key=True)
+    name = models.CharField(max_length=255)
+    source = models.CharField(max_length=64, default='facebook')
+    productId = models.CharField(max_length=100, blank=True, default='all')
+    productName = models.CharField(max_length=255, blank=True, default='Entire Store Catalog')
+    utmCampaign = models.CharField(max_length=150, blank=True, default='')
+    landingUrl = models.TextField(blank=True, default='')
+    spend = models.FloatField(default=0)
+    clicks = models.IntegerField(default=0)
+    isPaused = models.BooleanField(default=False)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ['-created_at']
+
+    def __str__(self):
+        return f"{self.name} ({self.source})"
 
 
