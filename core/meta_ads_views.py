@@ -651,11 +651,18 @@ def meta_campaign_launch_view(request):
         return Response({'success': False, 'message': 'Campaign name is required.'}, status=status.HTTP_400_BAD_REQUEST)
 
     public_origin = str(data.get('publicOrigin') or request.build_absolute_uri('/')[:-1]).rstrip('/')
+    backend_origin = request.build_absolute_uri('/')[:-1].rstrip('/')
     utm_slug = _slugify_utm(data.get('utmCampaign') or camp_name)
     data = dict(data)
     data['utmCampaign'] = utm_slug
 
-    ok, launch_res = launch_meta_campaign_flow(conn, raw_token, data, public_origin=public_origin)
+    ok, launch_res = launch_meta_campaign_flow(
+        conn,
+        raw_token,
+        data,
+        public_origin=public_origin,
+        backend_origin=backend_origin,
+    )
     if not ok:
         if launch_res.get('isBillingGuard'):
             conn.billingStatus = 'WARNING'
