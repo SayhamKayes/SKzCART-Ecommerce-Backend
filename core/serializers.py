@@ -2,7 +2,7 @@ from rest_framework import serializers
 from .models import (
     AuditLog, MarketingEvent, NotificationLog, MarketingConfig, ShopSetting,
     StaffMember, RecycleBinItem, StoreTenant, MetaTenantConnection,
-    SaaSAdCampaign, SaaSAdSet, SaaSAdCreativeAd
+    SaaSAdCampaign, SaaSAdSet, SaaSAdCreativeAd, MarketingUtmCampaign
 )
 
 class AuditLogSerializer(serializers.ModelSerializer):
@@ -138,6 +138,15 @@ class SaaSAdCampaignSerializer(serializers.ModelSerializer):
             'spend', 'impressions', 'reach', 'clicks', 'ctr', 'cpc', 'cpm',
             'metaPurchases', 'storeOrders', 'storeRevenue', 'roas',
             'isRemoteSynced', 'lastSyncedAt', 'adsets', 'created_at', 'updated_at'
+        ]
+
+
+class MarketingUtmCampaignSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = MarketingUtmCampaign
+        fields = [
+            'id', 'name', 'source', 'productId', 'productName', 'utmCampaign',
+            'landingUrl', 'spend', 'clicks', 'isPaused', 'created_at', 'updated_at'
         ]
 
 
