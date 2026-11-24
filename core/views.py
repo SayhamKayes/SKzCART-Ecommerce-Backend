@@ -2,9 +2,14 @@ from rest_framework.decorators import api_view, permission_classes
 from rest_framework.permissions import AllowAny
 from rest_framework.response import Response
 from rest_framework import status
+from django.conf import settings as django_settings
+from django.db import transaction
 from django.http import HttpResponse
 from django.utils import timezone
+import django
+import html as html_lib
 import os
+import platform
 import time
 import uuid
 
@@ -19,21 +24,141 @@ from .recycle_bin import (
 )
 from .capi import send_meta_capi_event
 
+
+def _is_local_url(url: str) -> bool:
+    lower = (url or '').lower()
+    return 'localhost' in lower or '127.0.0.1' in lower or '0.0.0.0' in lower
+
+
+def resolve_backend_runtime_context(request=None):
+    """
+    Resolves dynamic store branding, live backend URL, live storefront URL,
+    and runtime stack versions for root/status/health endpoints.
+    """
+    raw_shop_name = ''
+    custom_frontend_url = ''
+
+    try:
+        shop_obj = ShopSetting.get_settings()
+        extra_cfg = shop_obj.extraConfig if isinstance(shop_obj.extraConfig, dict) else {}
+        extra_shop = extra_cfg.get('shop', {}) if isinstance(extra_cfg.get('shop'), dict) else {}
+        raw_shop_name = str(extra_shop.get('name') or shop_obj.shopName or '').strip()
+        custom_frontend_url = str(
+            extra_shop.get('frontendUrl')
+            or extra_shop.get('websiteUrl')
+            or extra_cfg.get('frontendUrl')
+            or ''
+        ).strip().rstrip('/')
+    except Exception:
+        raw_shop_name = ''
+        custom_frontend_url = ''
+
+    if raw_shop_name and raw_shop_name.lower() != 'amardokan':
+        platform_title = f"{raw_shop_name} E-Commerce Backend"
+        store_label = raw_shop_name
+    else:
+        platform_title = "E-Commerce Backend"
+        store_label = "E-Commerce Platform"
+
+    # Resolve backend base URL dynamically from the active HTTP request / proxy headers
+    if request is not None:
+        forwarded_proto = (request.META.get('HTTP_X_FORWARDED_PROTO') or '').split(',')[0].strip()
+        scheme = forwarded_proto or ('https' if request.is_secure() else 'http')
+        host = (
+            request.META.get('HTTP_X_FORWARDED_HOST')
+            or request.get_host()
+            or '127.0.0.1:8000'
+        ).split(',')[0].strip()
+        backend_base_url = f"{scheme}://{host}".rstrip('/')
+    else:
+        backend_base_url = (
+            os.environ.get('BACKEND_URL')
+            or getattr(django_settings, 'SSLCOMMERZ_BACKEND_URL', '')
+            or 'http://127.0.0.1:8000'
+        ).strip().rstrip('/')
+        scheme = 'https' if backend_base_url.startswith('https://') else 'http'
+        host = backend_base_url.replace('https://', '').replace('http://', '').split('/')[0]
+
+    hostname = host.split(':')[0].lower()
+    backend_is_local = hostname in ('localhost', '127.0.0.1', '0.0.0.0')
+
+    # Resolve Storefront URL dynamically: ShopSetting -> live Env -> Request Origin -> Smart Host Fallback
+    env_frontend = (
+        os.environ.get('FRONTEND_URL')
+        or os.environ.get('APP_URL')
+        or os.environ.get('PUBLIC_SITE_URL')
+        or os.environ.get('SSLCOMMERZ_FRONTEND_URL')
+        or ''
+    ).strip().rstrip('/')
+
+    frontend_url = ''
+    if custom_frontend_url and (backend_is_local or not _is_local_url(custom_frontend_url)):
+        frontend_url = custom_frontend_url
+    elif env_frontend and (backend_is_local or not _is_local_url(env_frontend)):
+        frontend_url = env_frontend
+    elif request is not None:
+        req_origin = (request.META.get('HTTP_ORIGIN') or '').strip().rstrip('/')
+        if req_origin and req_origin != backend_base_url and (backend_is_local or not _is_local_url(req_origin)):
+            frontend_url = req_origin
+
+    if not frontend_url:
+        if backend_is_local:
+            frontend_url = f"{scheme}://{hostname}:3001"
+        elif hostname.startswith('api.'):
+            frontend_url = f"{scheme}://{hostname[4:]}"
+        else:
+            frontend_url = backend_base_url
+
+    endpoints = {
+        'health': f"{backend_base_url}/api/v1/health",
+        'products': f"{backend_base_url}/api/v1/products",
+        'orders': f"{backend_base_url}/api/v1/orders",
+        'checkout': f"{backend_base_url}/api/v1/checkout",
+        'tracking': f"{backend_base_url}/api/v1/tracking/lookup",
+        'couriers': f"{backend_base_url}/api/v1/couriers",
+        'couriers_assign': f"{backend_base_url}/api/v1/couriers/assign",
+        'courier_webhook': f"{backend_base_url}/api/v1/webhooks/couriers",
+        'audit_logs': f"{backend_base_url}/api/v1/audit-logs",
+        'notifications': f"{backend_base_url}/api/v1/notifications",
+        'marketing_events': f"{backend_base_url}/api/v1/marketing/events",
+        'admin': f"{backend_base_url}/admin/",
+    }
+
+    return {
+        'store_name': store_label,
+        'platform_title': platform_title,
+        'backend_base_url': backend_base_url,
+        'frontend_url': frontend_url,
+        'django_version': django.get_version(),
+        'python_version': platform.python_version(),
+        'endpoints': endpoints,
+    }
+
+
 @api_view(['GET'])
 @permission_classes([AllowAny])
 def api_root(request):
+    ctx = resolve_backend_runtime_context(request)
     accept_header = request.META.get('HTTP_ACCEPT', '')
     if 'text/html' in accept_header:
-        html_content = """<!DOCTYPE html>
+        safe_title = html_lib.escape(ctx['platform_title'])
+        safe_frontend_url = html_lib.escape(ctx['frontend_url'])
+        safe_backend_url = html_lib.escape(ctx['backend_base_url'])
+        safe_django_ver = html_lib.escape(ctx['django_version'])
+        safe_python_ver = html_lib.escape(ctx['python_version'])
+        ep = {k: html_lib.escape(v) for k, v in ctx['endpoints'].items()}
+
+        html_head = f"""<!DOCTYPE html>
 <html lang="bn">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>AmarDokan Backend Engine • Django REST</title>
+  <title>{safe_title} • Django REST</title>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&family=Hind+Siliguri:wght@400;600;700&display=swap" rel="stylesheet">
-  <style>
+"""
+        html_css = """  <style>
     :root {
       --bg: #090d16;
       --card: #111827;
@@ -179,61 +304,62 @@ def api_root(request):
     }
   </style>
 </head>
-<body>
+"""
+        html_body = f"""<body>
   <div class="container">
     <div class="badge">
       <span class="dot"></span>
       Django REST API Server Online
     </div>
-    <h1>AmarDokan Bangladesh Native E-Commerce Backend</h1>
+    <h1>{safe_title}</h1>
     <p class="lead">
       Welcome! Your Django REST Framework backend is running and healthy.<br>
       To browse and shop our storefront, click the button below to visit the frontend.
     </p>
 
     <div style="margin-bottom: 28px;">
-      <a href="http://localhost:3001" class="btn-frontend" target="_blank">
-        🛍️ Open Storefront Website (http://localhost:3001) →
+      <a href="{safe_frontend_url}" class="btn-frontend" target="_blank">
+        🛍️ Open Storefront Website ({safe_frontend_url}) →
       </a>
     </div>
 
     <div class="action-grid">
-      <a href="/api/v1/health" class="action-card" target="_blank">
+      <a href="{ep['health']}" class="action-card" target="_blank">
         <div class="action-title">
           API Health Check
           <span class="tag">GET</span>
         </div>
         <div class="action-desc">View system version and backend health response</div>
       </a>
-      <a href="/api/v1/products" class="action-card" target="_blank">
+      <a href="{ep['products']}" class="action-card" target="_blank">
         <div class="action-title">
           Products API
           <span class="tag">GET</span>
         </div>
         <div class="action-desc">Live JSON catalog data for all database products</div>
       </a>
-      <a href="/api/v1/orders" class="action-card" target="_blank">
+      <a href="{ep['orders']}" class="action-card" target="_blank">
         <div class="action-title">
           Orders API
           <span class="tag">GET</span>
         </div>
         <div class="action-desc">Customer orders and tracking history</div>
       </a>
-      <a href="/api/v1/couriers" class="action-card" target="_blank">
+      <a href="{ep['couriers']}" class="action-card" target="_blank">
         <div class="action-title">
           Courier Configs
           <span class="tag">GET</span>
         </div>
-        <div class="action-desc">Pathao, RedX, and Steadfast courier hub configurations</div>
+        <div class="action-desc">Pathao, Steadfast, RedX, and eCourier hub configurations</div>
       </a>
-      <a href="/api/v1/audit-logs" class="action-card" target="_blank">
+      <a href="{ep['audit_logs']}" class="action-card" target="_blank">
         <div class="action-title">
           Audit Logs
           <span class="tag">GET</span>
         </div>
         <div class="action-desc">System and administrator audit trail logs</div>
       </a>
-      <a href="/admin/" class="action-card" target="_blank">
+      <a href="{ep['admin']}" class="action-card" target="_blank">
         <div class="action-title">
           Django Admin Portal
           <span class="tag">PORTAL</span>
@@ -243,42 +369,35 @@ def api_root(request):
     </div>
 
     <div class="footer-note">
-      <div>Stack: <code>Django 5.2</code> + <code>DRF</code> + <code>Python 3.14</code></div>
-      <div>Frontend Proxy Target: <code>http://127.0.0.1:8000</code></div>
+      <div>Stack: <code>Django {safe_django_ver}</code> + <code>DRF</code> + <code>Python {safe_python_ver}</code></div>
+      <div>Frontend Proxy Target: <code>{safe_backend_url}</code></div>
     </div>
   </div>
 </body>
 </html>"""
-        return HttpResponse(html_content, content_type='text/html; charset=utf-8')
+        return HttpResponse(html_head + html_css + html_body, content_type='text/html; charset=utf-8')
 
     return Response({
         'status': 'online',
-        'platform': 'AmarDokan Bangladesh Native E-Commerce Backend (Django REST)',
+        'store_name': ctx['store_name'],
+        'platform': f"{ctx['platform_title']} (Django REST)",
         'version': '1.0.0',
-        'frontend_url': 'http://localhost:3001',
-        'endpoints': {
-            'health': '/api/v1/health',
-            'products': '/api/v1/products',
-            'orders': '/api/v1/orders',
-            'checkout': '/api/v1/checkout',
-            'tracking': '/api/v1/tracking/lookup',
-            'couriers': '/api/v1/couriers',
-            'couriers_assign': '/api/v1/couriers/assign',
-            'courier_webhook': '/api/v1/webhooks/couriers',
-            'audit_logs': '/api/v1/audit-logs',
-            'notifications': '/api/v1/notifications',
-            'marketing_events': '/api/v1/marketing/events',
-            'admin': '/admin/',
-        }
+        'backend_url': ctx['backend_base_url'],
+        'frontend_url': ctx['frontend_url'],
+        'endpoints': ctx['endpoints'],
     })
 
 @api_view(['GET'])
 @permission_classes([AllowAny])
 def health_check(request):
+    ctx = resolve_backend_runtime_context(request)
     return Response({
         'status': 'ok',
-        'platform': 'AmarDokan Bangladesh Native E-Commerce (Django REST)',
+        'store_name': ctx['store_name'],
+        'platform': f"{ctx['platform_title']} (Django REST)",
         'version': '1.0.0',
+        'backend_url': ctx['backend_base_url'],
+        'frontend_url': ctx['frontend_url'],
         'timestamp': timezone.localtime().isoformat()
     })
 
@@ -548,9 +667,15 @@ def marketing_events_view(request):
         for p in Product.objects.all().iterator():
             pid_str = str(p.id).strip()
             pname_str = str(p.name or '').strip()
+            pname_en_str = str(getattr(p, 'nameEn', '') or '').strip()
+            slug_str = str(getattr(p, 'slug', '') or '').strip()
             active_by_id[pid_str] = p
+            if slug_str:
+                active_by_id[slug_str] = p
             if pname_str:
                 active_by_name[pname_str.lower()] = p
+            if pname_en_str:
+                active_by_name[pname_en_str.lower()] = p
 
         def match_active_product(pid, pname):
             clean_pid = str(pid or '').strip()
@@ -693,7 +818,7 @@ def notifications_list(request):
         template_name = data.get('templateName', 'MANUAL_EMAIL')
         order_id = data.get('orderId', 'MANUAL-EMAIL')
 
-        if not recipient or '@' not in recipient or not message_text:
+        if not recipient or '@' not in recipient or '.' not in recipient.split('@')[-1] or not message_text:
             return Response({
                 'success': False,
                 'message': 'Valid recipient email and messageText are required.'
@@ -707,10 +832,11 @@ def notifications_list(request):
             order_id=order_id,
             subject=subject,
         )
+        provider_label = res.get('provider') or 'SMTP Gateway'
         return Response({
             'success': bool(res.get('success', False)),
             'result': res,
-            'message': f"Email dispatched to {recipient}" if res.get('success') else (res.get('error') or 'Email dispatch failed'),
+            'message': f"Email sent to {recipient} via {provider_label}" if res.get('success') else (res.get('error') or 'Email dispatch failed'),
         }, status=status.HTTP_201_CREATED if res.get('success') else status.HTTP_400_BAD_REQUEST)
 
 @api_view(['POST'])
@@ -930,18 +1056,26 @@ def shop_settings_view(request):
         'footerWorkingHours', 'footerWorkingHoursEn',
         'footerHotline', 'footerEmail',
         'footerCourier1', 'footerCourier2', 'footerCourier3',
-        'footerCopyrightText', 'footerPaymentColumns',
+        'footerCopyrightText', 'footerPaymentColumns', 'footerShowPayments',
     ]
 
+    def _safe_settings_payload(s_obj, footer_data):
+        out = dict(ShopSettingSerializer(s_obj).data)
+        if isinstance(out.get('extraConfig'), dict) and isinstance(out['extraConfig'].get('portalAccess'), dict):
+            safe_extra = dict(out['extraConfig'])
+            safe_portal = dict(safe_extra['portalAccess'])
+            safe_portal.pop('demoCustomerPassword', None)
+            safe_extra['portalAccess'] = safe_portal
+            out['extraConfig'] = safe_extra
+        for ff in footer_fields:
+            if ff in footer_data:
+                out[ff] = footer_data[ff]
+        return out
+
     if request.method == 'GET':
-        serializer = ShopSettingSerializer(settings)
-        out_data = dict(serializer.data)
         extra = settings.extraConfig if isinstance(settings.extraConfig, dict) else {}
         extra_footer = extra.get('footer', {}) if isinstance(extra.get('footer'), dict) else {}
-        for ff in footer_fields:
-            if ff in extra_footer:
-                out_data[ff] = extra_footer[ff]
-        return Response({'success': True, 'settings': out_data})
+        return Response({'success': True, 'settings': _safe_settings_payload(settings, extra_footer)})
 
     data = request.data
     fields = [
@@ -992,15 +1126,9 @@ def shop_settings_view(request):
         ip_address=request.META.get('REMOTE_ADDR', '127.0.0.1')
     )
 
-    serializer = ShopSettingSerializer(settings)
-    out_data = dict(serializer.data)
-    for ff in footer_fields:
-        if ff in extra_footer:
-            out_data[ff] = extra_footer[ff]
-
     return Response({
         'success': True,
-        'settings': out_data,
+        'settings': _safe_settings_payload(settings, extra_footer),
         'message': 'Shop settings updated successfully'
     })
 
@@ -1059,8 +1187,8 @@ def staff_list_or_create(request):
     if not username or len(username) < 3:
         return Response({'success': False, 'message': 'Username must be at least 3 characters long'}, status=status.HTTP_400_BAD_REQUEST)
     if not password or len(password) < 4:
-        return Response({'success': False, 'message': 'Password must be at least 4 characters long'}, status=status.HTTP_400_BAD_REQUEST)
-    if role not in ['ADMIN', 'MANAGER', 'DISPATCHER']:
+        return Response({'success': False, 'message': 'Password / PIN must be at least 4 characters long'}, status=status.HTTP_400_BAD_REQUEST)
+    if role not in ['ADMIN', 'MANAGER', 'DISPATCHER', 'RIDER']:
         role = 'MANAGER'
 
     if StaffMember.objects.filter(username__iexact=username).exists():
@@ -1147,7 +1275,7 @@ def staff_detail_update_delete(request, staff_id):
         staff.phone = str(data['phone']).strip()
     if 'email' in data:
         staff.email = str(data['email']).strip()
-    if 'role' in data and data['role'] in ['ADMIN', 'MANAGER', 'DISPATCHER']:
+    if 'role' in data and data['role'] in ['ADMIN', 'MANAGER', 'DISPATCHER', 'RIDER']:
         # Protect root admin from demotion
         if (staff.username.lower() != 'admin' and staff.id != 'staff-admin-root') or data['role'] == 'ADMIN':
             staff.role = data['role']
@@ -1470,6 +1598,75 @@ def security_2fa_view(request):
     })
 
 
+@api_view(['GET'])
+@permission_classes([AllowAny])
+def staff_setup_status_view(request):
+    """
+    GET /api/v1/staff-auth/setup-status — Reports whether initial Super Admin provisioning is needed.
+    """
+    StaffMember.seed_defaults_if_empty()
+    return Response({
+        'success': True,
+        'needsSetup': StaffMember.objects.count() == 0,
+    })
+
+
+@api_view(['POST'])
+@permission_classes([AllowAny])
+def staff_bootstrap_view(request):
+    """
+    POST /api/v1/staff-auth/bootstrap — Creates the initial Super Admin ONLY when StaffMember table is empty.
+    Replaces hardcoded fixed demo staff credentials.
+    """
+    data = request.data if isinstance(request.data, dict) else {}
+    name = str(data.get('name', 'Super Admin')).strip() or 'Super Admin'
+    username = str(data.get('username', '')).strip().lower()
+    password = str(data.get('password', '')).strip()
+    email = str(data.get('email', '')).strip()
+    phone = str(data.get('phone', '')).strip()
+
+    if not username or len(username) < 3:
+        return Response({'success': False, 'message': 'Username must be at least 3 characters.'}, status=status.HTTP_400_BAD_REQUEST)
+    if len(password) < 6:
+        return Response({'success': False, 'message': 'Password must be at least 6 characters.'}, status=status.HTTP_400_BAD_REQUEST)
+
+    with transaction.atomic():
+        if StaffMember.objects.select_for_update().count() > 0:
+            return Response({
+                'success': False,
+                'message': 'Initial Super Admin is already configured. Please sign in normally.'
+            }, status=status.HTTP_403_FORBIDDEN)
+
+        staff = StaffMember.objects.create(
+            id='staff-admin-root',
+            name=name,
+            username=username,
+            phone=phone,
+            email=email,
+            password=password,
+            role='ADMIN',
+            status='ACTIVE',
+            notes='Primary store owner initialized via Admin Setup Wizard'
+        )
+
+    token = generate_staff_token(staff)
+    AuditLog.log(
+        actor=staff.name,
+        role='ADMIN',
+        action='INITIAL_ADMIN_BOOTSTRAP',
+        target_type='SETTINGS',
+        target_id=staff.id,
+        details=f"Initial Super Admin @{staff.username} provisioned via setup wizard.",
+        ip_address=request.META.get('REMOTE_ADDR', '127.0.0.1'),
+    )
+    return Response({
+        'success': True,
+        'token': token,
+        'message': f'Super Admin @{staff.username} created and signed in!',
+        'user': _serialize_staff_user(staff),
+    }, status=status.HTTP_201_CREATED)
+
+
 @api_view(['POST'])
 @permission_classes([AllowAny])
 def staff_login_view(request):
@@ -1490,10 +1687,6 @@ def staff_login_view(request):
 
     staff = StaffMember.objects.filter(username__iexact=username).first()
 
-    if not staff and username == 'admin' and password == 'admin1234':
-        StaffMember.seed_defaults_if_empty()
-        staff = StaffMember.objects.filter(username='admin').first()
-
     if not staff or staff.password != password:
         return Response({
             'success': False,
@@ -1507,7 +1700,26 @@ def staff_login_view(request):
         }, status=status.HTTP_403_FORBIDDEN)
 
     settings_obj = ShopSetting.get_settings()
-    sec = (settings_obj.extraConfig or {}).get('security', {}) if isinstance(settings_obj.extraConfig, dict) else {}
+    extra_cfg = settings_obj.extraConfig if isinstance(settings_obj.extraConfig, dict) else {}
+    portal = str(data.get('portal') or 'admin').strip().lower()
+    portal_cfg = extra_cfg.get('portalAccess', {}) if isinstance(extra_cfg.get('portalAccess'), dict) else {}
+
+    if portal == 'front_panel':
+        allowed_front_roles = portal_cfg.get('frontPanelAllowedRoles')
+        if not isinstance(allowed_front_roles, list) or len(allowed_front_roles) == 0:
+            allowed_front_roles = ['ADMIN']
+        if staff.role not in allowed_front_roles:
+            return Response({
+                'success': False,
+                'message': f'Access denied: {staff.role} role is not permitted for Front Panel Customizer.'
+            }, status=status.HTTP_403_FORBIDDEN)
+    elif portal == 'admin' and staff.role == 'RIDER':
+        return Response({
+            'success': False,
+            'message': 'Delivery Rider accounts must sign in through the Courier Rider Portal.'
+        }, status=status.HTTP_403_FORBIDDEN)
+
+    sec = extra_cfg.get('security', {}) if isinstance(extra_cfg.get('security'), dict) else {}
     two_fa_enabled = bool(sec.get('twoFactorEnabled', False))
     two_fa_scope = str(sec.get('twoFactorScope') or 'ALL_STAFF').upper()
     applies_to_staff = two_fa_enabled and (two_fa_scope == 'ALL_STAFF' or staff.role == 'ADMIN')
@@ -1592,7 +1804,26 @@ def staff_verify_2fa_view(request):
         return Response({'success': False, 'message': 'Account unavailable or suspended.'}, status=status.HTTP_403_FORBIDDEN)
 
     settings_obj = ShopSetting.get_settings()
-    sec = (settings_obj.extraConfig or {}).get('security', {}) if isinstance(settings_obj.extraConfig, dict) else {}
+    extra_cfg = settings_obj.extraConfig if isinstance(settings_obj.extraConfig, dict) else {}
+    portal = str(data.get('portal') or 'admin').strip().lower()
+    portal_cfg = extra_cfg.get('portalAccess', {}) if isinstance(extra_cfg.get('portalAccess'), dict) else {}
+
+    if portal == 'front_panel':
+        allowed_front_roles = portal_cfg.get('frontPanelAllowedRoles')
+        if not isinstance(allowed_front_roles, list) or len(allowed_front_roles) == 0:
+            allowed_front_roles = ['ADMIN']
+        if staff.role not in allowed_front_roles:
+            return Response({
+                'success': False,
+                'message': f'Access denied: {staff.role} role is not permitted for Front Panel Customizer.'
+            }, status=status.HTTP_403_FORBIDDEN)
+    elif portal == 'admin' and staff.role == 'RIDER':
+        return Response({
+            'success': False,
+            'message': 'Delivery Rider accounts must sign in through the Courier Rider Portal.'
+        }, status=status.HTTP_403_FORBIDDEN)
+
+    sec = extra_cfg.get('security', {}) if isinstance(extra_cfg.get('security'), dict) else {}
     method = str(payload.get('method') or sec.get('twoFactorMethod') or 'TOTP').upper()
 
     is_valid = False
@@ -1777,11 +2008,222 @@ def staff_verify_token_view(request):
             'message': 'Account is suspended or deleted.'
         }, status=status.HTTP_403_FORBIDDEN)
 
+    portal = str(request.query_params.get('portal') or '').strip().lower()
+    if portal in ('front_panel', 'rider'):
+        settings_obj = ShopSetting.get_settings()
+        extra_cfg = settings_obj.extraConfig if isinstance(settings_obj.extraConfig, dict) else {}
+        portal_cfg = extra_cfg.get('portalAccess', {}) if isinstance(extra_cfg.get('portalAccess'), dict) else {}
+        if portal == 'front_panel':
+            allowed = portal_cfg.get('frontPanelAllowedRoles') or ['ADMIN']
+            if staff.role not in allowed:
+                return Response({'success': False, 'message': 'Front Panel access revoked by administrator.'}, status=status.HTTP_403_FORBIDDEN)
+        elif portal == 'rider':
+            allowed = portal_cfg.get('riderPortalAllowedRoles') or ['RIDER', 'DISPATCHER', 'ADMIN']
+            if staff.role not in allowed:
+                return Response({'success': False, 'message': 'Rider Portal access revoked by administrator.'}, status=status.HTTP_403_FORBIDDEN)
+
     serializer = StaffMemberSerializer(staff)
     return Response({
         'success': True,
         'valid': True,
         'user': serializer.data
+    })
+
+
+@api_view(['GET', 'POST'])
+@permission_classes([AllowAny])
+def portal_access_view(request):
+    """
+    GET /api/v1/security/portal-access — Return central DB Portal Access & Demo Customer settings.
+    POST /api/v1/security/portal-access — Update Front Panel, Rider Portal & Demo Customer access rules.
+    """
+    settings_obj = ShopSetting.get_settings()
+    extra = dict(settings_obj.extraConfig) if isinstance(settings_obj.extraConfig, dict) else {}
+    cfg = dict(extra.get('portalAccess')) if isinstance(extra.get('portalAccess'), dict) else {}
+
+    def _serialize_portal_access(p):
+        fp_roles = p.get('frontPanelAllowedRoles')
+        if not isinstance(fp_roles, list) or len(fp_roles) == 0:
+            fp_roles = ['ADMIN']
+        rider_roles = p.get('riderPortalAllowedRoles')
+        if not isinstance(rider_roles, list) or len(rider_roles) == 0:
+            rider_roles = ['RIDER', 'DISPATCHER', 'ADMIN']
+        return {
+            'frontPanelAllowedRoles': fp_roles,
+            'riderPortalAllowedRoles': rider_roles,
+            'demoCustomerEnabled': bool(p.get('demoCustomerEnabled', False)),
+            'demoCustomerPhone': str(p.get('demoCustomerPhone') or ''),
+            'hasDemoCustomerPassword': bool(p.get('demoCustomerPassword')),
+            'updatedAt': p.get('updatedAt', ''),
+        }
+
+    if request.method == 'GET':
+        return Response({'success': True, 'portalAccess': _serialize_portal_access(cfg)})
+
+    data = request.data or {}
+    actor = str(data.get('actor') or 'Admin').strip()
+    ip_addr = request.META.get('REMOTE_ADDR', '127.0.0.1')
+
+    valid_staff_roles = {'ADMIN', 'MANAGER', 'DISPATCHER', 'RIDER'}
+    if isinstance(data.get('frontPanelAllowedRoles'), list):
+        clean_fp = [str(r).strip().upper() for r in data['frontPanelAllowedRoles'] if str(r).strip().upper() in valid_staff_roles]
+        if 'ADMIN' not in clean_fp:
+            clean_fp.insert(0, 'ADMIN')
+        cfg['frontPanelAllowedRoles'] = clean_fp
+
+    if isinstance(data.get('riderPortalAllowedRoles'), list):
+        clean_rider = [str(r).strip().upper() for r in data['riderPortalAllowedRoles'] if str(r).strip().upper() in valid_staff_roles]
+        if not clean_rider:
+            clean_rider = ['RIDER']
+        cfg['riderPortalAllowedRoles'] = clean_rider
+
+    if 'demoCustomerEnabled' in data:
+        cfg['demoCustomerEnabled'] = bool(data['demoCustomerEnabled'])
+
+    if 'demoCustomerPhone' in data:
+        digits = ''.join(ch for ch in str(data.get('demoCustomerPhone') or '') if ch.isdigit())
+        if digits.startswith('880'):
+            digits = digits[2:]
+        elif not digits.startswith('0') and len(digits) >= 10:
+            digits = '0' + digits
+        cfg['demoCustomerPhone'] = digits
+
+    new_demo_pass = str(data.get('demoCustomerPassword') or '').strip()
+    if new_demo_pass:
+        if len(new_demo_pass) < 4:
+            return Response({'success': False, 'message': 'Demo customer password must be at least 4 characters.'}, status=status.HTTP_400_BAD_REQUEST)
+        cfg['demoCustomerPassword'] = new_demo_pass
+
+    if cfg.get('demoCustomerEnabled'):
+        if not cfg.get('demoCustomerPhone') or len(cfg['demoCustomerPhone']) < 11:
+            return Response({'success': False, 'message': 'Enter a valid 11-digit demo customer phone number before enabling.'}, status=status.HTTP_400_BAD_REQUEST)
+        if not cfg.get('demoCustomerPassword'):
+            return Response({'success': False, 'message': 'Set a demo customer password (min 4 chars) before enabling.'}, status=status.HTTP_400_BAD_REQUEST)
+        try:
+            from users.models import CustomerProfile
+            from django.contrib.auth.hashers import make_password
+            demo_phone = cfg['demoCustomerPhone']
+            prof = CustomerProfile.objects.filter(phone=demo_phone).first()
+            if prof:
+                prof.password = make_password(cfg['demoCustomerPassword'])
+                prof.save(update_fields=['password'])
+        except Exception:
+            pass
+
+    cfg['updatedAt'] = timezone.localtime().strftime('%Y-%m-%d %H:%M:%S')
+    extra['portalAccess'] = cfg
+    settings_obj.extraConfig = extra
+    settings_obj.save(update_fields=['extraConfig', 'updated_at'])
+
+    AuditLog.log(
+        actor=actor,
+        role='ADMIN',
+        action='PORTAL_ACCESS_UPDATED',
+        target_type='SETTINGS',
+        target_id='default_shop_setting',
+        details=f"Portal access updated: FrontPanel={cfg.get('frontPanelAllowedRoles')}, RiderPortal={cfg.get('riderPortalAllowedRoles')}, DemoCustomer={'ENABLED' if cfg.get('demoCustomerEnabled') else 'DISABLED'}",
+        ip_address=ip_addr,
+    )
+
+    return Response({
+        'success': True,
+        'message': 'Portal access & authentication settings updated successfully.',
+        'portalAccess': _serialize_portal_access(cfg),
+    })
+
+
+@api_view(['GET'])
+@permission_classes([AllowAny])
+def courier_riders_list_view(request):
+    """
+    GET /api/v1/courier-auth/riders — Return active riders/staff permitted to access Courier Rider Portal.
+    """
+    StaffMember.seed_defaults_if_empty()
+    settings_obj = ShopSetting.get_settings()
+    extra_cfg = settings_obj.extraConfig if isinstance(settings_obj.extraConfig, dict) else {}
+    portal_cfg = extra_cfg.get('portalAccess', {}) if isinstance(extra_cfg.get('portalAccess'), dict) else {}
+    allowed_roles = portal_cfg.get('riderPortalAllowedRoles')
+    if not isinstance(allowed_roles, list) or len(allowed_roles) == 0:
+        allowed_roles = ['RIDER', 'DISPATCHER', 'ADMIN']
+
+    role_rank = {'RIDER': 0, 'DISPATCHER': 1, 'MANAGER': 2, 'ADMIN': 3}
+    riders_qs = StaffMember.objects.filter(status='ACTIVE', role__in=allowed_roles).order_by('created_at')
+    riders = [
+        {
+            'id': s.id,
+            'name': s.name,
+            'username': s.username,
+            'phone': s.phone,
+            'role': s.role,
+            'notes': s.notes,
+        }
+        for s in sorted(riders_qs, key=lambda item: (role_rank.get(item.role, 9), item.name.lower()))
+    ]
+    return Response({
+        'success': True,
+        'riders': riders,
+        'allowedRoles': allowed_roles,
+    })
+
+
+@api_view(['POST'])
+@permission_classes([AllowAny])
+def courier_rider_login_view(request):
+    """
+    POST /api/v1/courier-auth/login — Authenticate a Courier Rider / Logistics staff member against central DB StaffMember.
+    """
+    StaffMember.seed_defaults_if_empty()
+    data = request.data or {}
+    rider_id = str(data.get('riderId') or '').strip()
+    username = str(data.get('username') or '').strip().lower()
+    pin = str(data.get('pin') or data.get('password') or '').strip()
+
+    if not pin:
+        return Response({'success': False, 'message': 'Please enter your Rider PIN / Password.'}, status=status.HTTP_400_BAD_REQUEST)
+
+    staff = None
+    if rider_id:
+        staff = StaffMember.objects.filter(id=rider_id).first()
+    if not staff and username:
+        staff = StaffMember.objects.filter(username__iexact=username).first()
+    if not staff and username:
+        staff = StaffMember.objects.filter(phone=username).first()
+
+    if not staff or staff.password != pin:
+        return Response({'success': False, 'message': 'Invalid Rider credentials or PIN. Please try again.'}, status=status.HTTP_401_UNAUTHORIZED)
+
+    if staff.status == 'SUSPENDED':
+        return Response({'success': False, 'message': 'This rider account has been suspended by administrator.'}, status=status.HTTP_403_FORBIDDEN)
+
+    settings_obj = ShopSetting.get_settings()
+    extra_cfg = settings_obj.extraConfig if isinstance(settings_obj.extraConfig, dict) else {}
+    portal_cfg = extra_cfg.get('portalAccess', {}) if isinstance(extra_cfg.get('portalAccess'), dict) else {}
+    allowed_roles = portal_cfg.get('riderPortalAllowedRoles')
+    if not isinstance(allowed_roles, list) or len(allowed_roles) == 0:
+        allowed_roles = ['RIDER', 'DISPATCHER', 'ADMIN']
+
+    if staff.role not in allowed_roles:
+        return Response({
+            'success': False,
+            'message': f'Access denied: {staff.role} role is currently not permitted in Rider Portal.'
+        }, status=status.HTTP_403_FORBIDDEN)
+
+    token = generate_staff_token(staff)
+    AuditLog.log(
+        actor=staff.name,
+        role=staff.role,
+        action='RIDER_PORTAL_LOGIN',
+        target_type='SETTINGS',
+        target_id=staff.id,
+        details=f"Rider portal login: {staff.name} (@{staff.username}) as {staff.role}",
+        ip_address=request.META.get('REMOTE_ADDR', '127.0.0.1'),
+    )
+
+    return Response({
+        'success': True,
+        'token': token,
+        'message': f'Welcome to Rider Hub, {staff.name}!',
+        'rider': _serialize_staff_user(staff),
     })
 
 
