@@ -1,3 +1,4 @@
+import os
 import uuid
 from django.db import models
 from django.utils import timezone
@@ -199,6 +200,7 @@ class StaffMember(models.Model):
         ('ADMIN', 'Super Admin'),
         ('MANAGER', 'Operations Manager'),
         ('DISPATCHER', 'Logistics Dispatcher'),
+        ('RIDER', 'Delivery Rider'),
     ]
     STATUS_CHOICES = [
         ('ACTIVE', 'Active'),
@@ -225,40 +227,30 @@ class StaffMember(models.Model):
 
     @classmethod
     def seed_defaults_if_empty(cls):
-        if cls.objects.count() == 0:
-            cls.objects.create(
-                id='staff-admin-root',
-                name='Super Admin (Owner)',
-                username='admin',
-                phone='01712849201',
-                email='admin@amardokan.com',
-                password='admin1234',
-                role='ADMIN',
-                status='ACTIVE',
-                notes='Primary store owner with full unrestricted authority'
-            )
-            cls.objects.create(
-                id='staff-manager-demo',
-                name='Operations Manager',
-                username='manager',
-                phone='01812345678',
-                email='manager@amardokan.com',
-                password='manager1234',
-                role='MANAGER',
-                status='ACTIVE',
-                notes='Manages daily operations, stock, orders, and customer queries'
-            )
-            cls.objects.create(
-                id='staff-dispatcher-demo',
-                name='Delivery Dispatcher (Logistics)',
-                username='dispatcher',
-                phone='01912345678',
-                email='dispatcher@amardokan.com',
-                password='dispatcher1234',
-                role='DISPATCHER',
-                status='ACTIVE',
-                notes='Fulfills orders, prints packing slips, and hands over to Steadfast/Pathao/RedX'
-            )
+        """
+        Optionally creates an initial Super Admin ONLY when the StaffMember table is empty
+        AND explicit ADMIN_PASS / INITIAL_ADMIN_PASSWORD is configured in environment variables.
+        Never provisions hardcoded demo credentials or fixed default passwords.
+        """
+        if cls.objects.count() > 0:
+            return
+        init_pass = (os.getenv('ADMIN_PASS') or os.getenv('INITIAL_ADMIN_PASSWORD') or '').strip()
+        if not init_pass:
+            return
+        init_user = (os.getenv('ADMIN_USER') or 'admin').strip().lower()
+        init_email = (os.getenv('ADMIN_EMAIL') or '').strip()
+        init_phone = (os.getenv('ADMIN_PHONE') or '').strip()
+        cls.objects.create(
+            id='staff-admin-root',
+            name='Super Admin (Owner)',
+            username=init_user,
+            phone=init_phone,
+            email=init_email,
+            password=init_pass,
+            role='ADMIN',
+            status='ACTIVE',
+            notes='Provisioned from environment initial admin configuration'
+        )
 
 
 class RecycleBinItem(models.Model):
@@ -528,5 +520,38 @@ class MarketingUtmCampaign(models.Model):
 
     def __str__(self):
         return f"{self.name} ({self.source})"
+
+
+class AnalyticsVisit(models.Model):
+    """Real-time storefront visitor, session, source, device, geo, and e-commerce funnel telemetry."""
+    id = models.CharField(max_length=64, primary_key=True)
+    visitorId = models.CharField(max_length=120, db_index=True)
+    sessionId = models.CharField(max_length=120, db_index=True)
+    eventType = models.CharField(max_length=50, default='page_view', db_index=True)
+    pagePath = models.CharField(max_length=255, default='/')
+    pageTitle = models.CharField(max_length=255, blank=True, default='')
+    trafficSource = models.CharField(max_length=80, default='Direct', db_index=True)
+    referrerHost = models.CharField(max_length=150, blank=True, default='')
+    utmMedium = models.CharField(max_length=100, blank=True, default='')
+    utmCampaign = models.CharField(max_length=150, blank=True, default='')
+    deviceType = models.CharField(max_length=30, default='Desktop', db_index=True)
+    browserName = models.CharField(max_length=50, blank=True, default='Chrome')
+    city = models.CharField(max_length=100, blank=True, default='Dhaka')
+    country = models.CharField(max_length=100, blank=True, default='Bangladesh')
+    isNewVisitor = models.BooleanField(default=True)
+    durationSeconds = models.IntegerField(default=0)
+    orderId = models.CharField(max_length=100, blank=True, default='')
+    productId = models.CharField(max_length=100, blank=True, default='')
+    productName = models.CharField(max_length=255, blank=True, default='')
+    value = models.FloatField(default=0)
+    timestamp = models.CharField(max_length=50, blank=True, default='')
+    created_at = models.DateTimeField(auto_now_add=True, db_index=True)
+
+    class Meta:
+        ordering = ['-created_at']
+
+    def __str__(self):
+        return f"{self.eventType} | {self.trafficSource} | {self.deviceType} | {self.city}"
+
 
 

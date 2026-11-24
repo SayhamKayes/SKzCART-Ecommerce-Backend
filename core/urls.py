@@ -1,9 +1,18 @@
 from django.urls import path
 from . import views
 from . import meta_ads_views
+from . import analytics_views
 
 urlpatterns = [
     path('health', views.health_check, name='health_check'),
+    path('analytics/ga4/config', analytics_views.ga4_config_view, name='ga4_config'),
+    path('analytics/ga4/config/', analytics_views.ga4_config_view, name='ga4_config_slash'),
+    path('analytics/ga4/collect', analytics_views.ga4_collect_view, name='ga4_collect'),
+    path('analytics/ga4/collect/', analytics_views.ga4_collect_view, name='ga4_collect_slash'),
+    path('analytics/ga4/test', analytics_views.ga4_test_view, name='ga4_test'),
+    path('analytics/ga4/test/', analytics_views.ga4_test_view, name='ga4_test_slash'),
+    path('analytics/ga4/dashboard', analytics_views.ga4_dashboard_view, name='ga4_dashboard'),
+    path('analytics/ga4/dashboard/', analytics_views.ga4_dashboard_view, name='ga4_dashboard_slash'),
     path('audit-logs/bulk-delete', views.audit_logs_bulk_delete_view, name='audit_logs_bulk_delete'),
     path('audit-logs/bulk-delete/', views.audit_logs_bulk_delete_view, name='audit_logs_bulk_delete_slash'),
     path('audit-logs/<str:pk>', views.audit_log_delete_view, name='audit_log_delete'),
@@ -42,6 +51,10 @@ urlpatterns = [
     path('staff/', views.staff_list_or_create, name='staff_list_or_create_slash'),
     path('staff/<str:staff_id>', views.staff_detail_update_delete, name='staff_detail_update_delete'),
     path('staff/<str:staff_id>/', views.staff_detail_update_delete, name='staff_detail_update_delete_slash'),
+    path('staff-auth/setup-status', views.staff_setup_status_view, name='staff_setup_status'),
+    path('staff-auth/setup-status/', views.staff_setup_status_view, name='staff_setup_status_slash'),
+    path('staff-auth/bootstrap', views.staff_bootstrap_view, name='staff_bootstrap'),
+    path('staff-auth/bootstrap/', views.staff_bootstrap_view, name='staff_bootstrap_slash'),
     path('staff-auth/login', views.staff_login_view, name='staff_login'),
     path('staff-auth/login/', views.staff_login_view, name='staff_login_slash'),
     path('staff-auth/verify-2fa', views.staff_verify_2fa_view, name='staff_verify_2fa'),
@@ -54,6 +67,12 @@ urlpatterns = [
     path('staff-auth/verify/', views.staff_verify_token_view, name='staff_verify_token_slash'),
     path('security/2fa', views.security_2fa_view, name='security_2fa'),
     path('security/2fa/', views.security_2fa_view, name='security_2fa_slash'),
+    path('security/portal-access', views.portal_access_view, name='portal_access'),
+    path('security/portal-access/', views.portal_access_view, name='portal_access_slash'),
+    path('courier-auth/riders', views.courier_riders_list_view, name='courier_riders_list'),
+    path('courier-auth/riders/', views.courier_riders_list_view, name='courier_riders_list_slash'),
+    path('courier-auth/login', views.courier_rider_login_view, name='courier_rider_login'),
+    path('courier-auth/login/', views.courier_rider_login_view, name='courier_rider_login_slash'),
     path('recycle-bin/bulk-restore', views.recycle_bin_bulk_restore_view, name='recycle_bin_bulk_restore'),
     path('recycle-bin/bulk-restore/', views.recycle_bin_bulk_restore_view, name='recycle_bin_bulk_restore_slash'),
     path('recycle-bin/bulk-delete', views.recycle_bin_bulk_delete_view, name='recycle_bin_bulk_delete'),
