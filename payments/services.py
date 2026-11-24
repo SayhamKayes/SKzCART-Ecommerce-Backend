@@ -50,7 +50,7 @@ DEFAULT_PAYMENT_METHODS = [
         'name': 'bKash Manual',
         'is_active': True,
         'account_type': 'MERCHANT',
-        'number': '01892-019281',
+        'number': '',
         'counter': '1',
         'instructions': "Select 'Payment' in your bKash app, pay to the merchant number, and enter the TrxID below.",
         'display_order': 3,
@@ -60,7 +60,7 @@ DEFAULT_PAYMENT_METHODS = [
         'name': 'Nagad Manual',
         'is_active': True,
         'account_type': 'MERCHANT',
-        'number': '01918-293810',
+        'number': '',
         'counter': '1',
         'instructions': "Select 'Payment' in your Nagad app, pay to the merchant number, and enter the TrxID below.",
         'display_order': 4,
@@ -70,12 +70,26 @@ DEFAULT_PAYMENT_METHODS = [
         'name': 'Rocket Manual',
         'is_active': True,
         'account_type': 'MERCHANT',
-        'number': '01712-345678',
+        'number': '',
         'counter': '1',
         'instructions': "Select 'Merchant Pay' in your Rocket app, pay to the merchant number, and enter the TrxID below.",
         'display_order': 5,
     },
 ]
+
+
+def get_payment_controls():
+    """Reads Admin-managed payment behavior flags from central ShopSetting.extraConfig."""
+    try:
+        from core.models import ShopSetting
+        s = ShopSetting.get_settings()
+        extra = s.extraConfig if isinstance(s.extraConfig, dict) else {}
+        pc = extra.get('paymentControls') if isinstance(extra.get('paymentControls'), dict) else {}
+        return {
+            'allowSandboxSimulator': bool(pc.get('allowSandboxSimulator', False)),
+        }
+    except Exception:
+        return {'allowSandboxSimulator': False}
 
 
 def get_or_seed_payment_methods():
@@ -98,8 +112,8 @@ def get_gateway_config():
         gateway_id='sslcommerz',
         defaults={
             'name': 'SSLCOMMERZ Multi-Card & MFS Gateway',
-            'store_id': getattr(settings, 'SSLCOMMERZ_STORE_ID', 'testbox'),
-            'store_password': getattr(settings, 'SSLCOMMERZ_STORE_PASSWORD', 'qwerty'),
+            'store_id': getattr(settings, 'SSLCOMMERZ_STORE_ID', ''),
+            'store_password': getattr(settings, 'SSLCOMMERZ_STORE_PASSWORD', ''),
             'is_sandbox': getattr(settings, 'SSLCOMMERZ_IS_SANDBOX', True),
             'is_active': True,
             'fee_percent': Decimal('2.0'),
@@ -343,8 +357,9 @@ def initiate_sslcommerz_payment(order_id=None, amount=None, customer_data=None, 
             raw['initiate_response'] = response_json
             transaction.raw_payload = raw
 
-            # Fallback to local Sandbox Simulator ONLY if in sandbox mode
-            if config.is_sandbox:
+            # Fallback to local Sandbox Simulator ONLY if Admin explicitly enabled allowSandboxSimulator AND in sandbox mode
+            allow_sim = get_payment_controls().get('allowSandboxSimulator', False)
+            if config.is_sandbox and allow_sim:
                 simulator_url = f"{backend_url}/api/v1/payments/sslcommerz/sandbox-simulator/?tran_id={tran_id}"
                 transaction.gateway_url = simulator_url
                 transaction.save(update_fields=['error_reason', 'raw_payload', 'gateway_url'])
@@ -356,7 +371,7 @@ def initiate_sslcommerz_payment(order_id=None, amount=None, customer_data=None, 
                     'amount': resolved_amount,
                     'is_sandbox': True,
                     'mode': 'SANDBOX_SIMULATOR',
-                    'note': 'SSLCommerz sandbox API reached limits or returned error; routed to built-in SSLCommerz interactive sandbox simulator.'
+                    'note': 'SSLCommerz sandbox API returned error; routed to Admin-enabled local sandbox simulator.'
                 }
 
             transaction.status = 'FAILED'
@@ -371,8 +386,9 @@ def initiate_sslcommerz_payment(order_id=None, amount=None, customer_data=None, 
         logger.exception(f"SSLCommerz connection error: {str(e)}")
         transaction.error_reason = f"Connection error: {str(e)}"
 
-        # If sandbox, allow sandbox simulator so development & testing never break
-        if config.is_sandbox:
+        # Route to local simulator ONLY when Admin explicitly enabled allowSandboxSimulator in sandbox mode
+        allow_sim = get_payment_controls().get('allowSandboxSimulator', False)
+        if config.is_sandbox and allow_sim:
             simulator_url = f"{backend_url}/api/v1/payments/sslcommerz/sandbox-simulator/?tran_id={tran_id}"
             transaction.gateway_url = simulator_url
             transaction.save(update_fields=['error_reason', 'gateway_url'])
@@ -384,7 +400,7 @@ def initiate_sslcommerz_payment(order_id=None, amount=None, customer_data=None, 
                 'amount': resolved_amount,
                 'is_sandbox': True,
                 'mode': 'SANDBOX_SIMULATOR',
-                'note': 'SSLCommerz external sandbox was unreachable; routed to built-in SSLCommerz interactive sandbox simulator.'
+                'note': 'SSLCommerz external sandbox was unreachable; routed to Admin-enabled local sandbox simulator.'
             }
 
         transaction.status = 'FAILED'
@@ -401,9 +417,10 @@ def validate_sslcommerz_transaction(val_id, tran_id=None):
     Validates a transaction using SSLCommerz Validation Server API.
     """
     config = get_gateway_config()
+    allow_sim = get_payment_controls().get('allowSandboxSimulator', False)
 
     if not val_id:
-        if config.is_sandbox and tran_id:
+        if config.is_sandbox and allow_sim and tran_id:
             return {
                 'status': 'VALID',
                 'val_id': f"SANDBOX-VAL-{tran_id}",
@@ -419,8 +436,10 @@ def validate_sslcommerz_transaction(val_id, tran_id=None):
     if str(val_id).strip().upper().startswith(('INVALID', 'WRONG', 'FAIL')):
         return {'status': 'FAILED', 'error': 'Invalid validation ID (val_id) provided.'}
 
-    # If it's a simulated sandbox transaction, validate directly
+    # If it's a simulated sandbox transaction, validate ONLY when sandbox simulator is active
     if str(val_id).startswith('SIM-') or str(val_id).startswith('SANDBOX-'):
+        if not (config.is_sandbox and allow_sim):
+            return {'status': 'FAILED', 'error': 'Simulated validation rejected in strict Live/No-Simulator mode.'}
         return {
             'status': 'VALID',
             'val_id': val_id,
@@ -450,7 +469,7 @@ def validate_sslcommerz_transaction(val_id, tran_id=None):
                     'error': data.get('error') or f"Gateway returned {data.get('status')}",
                     'raw': data,
                 }
-            if config.is_sandbox and data.get('status') not in ['VALID', 'VALIDATED']:
+            if config.is_sandbox and allow_sim and data.get('status') not in ['VALID', 'VALIDATED']:
                 logger.info(f"Sandbox SSLCommerz validation fallback for {val_id}")
                 return {
                     'status': 'VALID',
@@ -463,7 +482,7 @@ def validate_sslcommerz_transaction(val_id, tran_id=None):
             return data
         else:
             logger.warning(f"SSLCommerz validator HTTP error: {resp.status_code} - {resp.text[:150]}")
-            if config.is_sandbox:
+            if config.is_sandbox and allow_sim:
                 return {
                     'status': 'VALID',
                     'val_id': val_id,
@@ -475,8 +494,7 @@ def validate_sslcommerz_transaction(val_id, tran_id=None):
             return {'status': 'FAILED', 'error': f"HTTP {resp.status_code}"}
     except Exception as e:
         logger.error(f"SSLCommerz validation request failed: {str(e)}")
-        # In sandbox, fallback to valid if we have valid val_id
-        if config.is_sandbox:
+        if config.is_sandbox and allow_sim:
             return {
                 'status': 'VALID',
                 'val_id': val_id or f"SANDBOX-VAL-{tran_id}",

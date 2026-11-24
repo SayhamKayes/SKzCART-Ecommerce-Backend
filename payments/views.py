@@ -1,5 +1,6 @@
 import json
 import logging
+import time
 import urllib.parse
 from django.shortcuts import redirect
 from django.http import HttpResponse, HttpResponseRedirect
@@ -16,6 +17,7 @@ from .models import PaymentTransaction, PaymentGatewayConfig, PaymentMethodSetti
 from .serializers import PaymentTransactionSerializer, PaymentGatewayConfigSerializer, PaymentMethodSettingSerializer
 from .services import (
     get_gateway_config,
+    get_payment_controls,
     get_or_seed_payment_methods,
     get_base_urls,
     initiate_sslcommerz_payment,
@@ -347,7 +349,16 @@ def sandbox_simulator_view(request):
     """
     GET /api/v1/payments/sslcommerz/sandbox-simulator/
     Interactive Sandbox Simulator to test SSLCommerz payment options locally.
+    Restricted cleanly by Admin Panel's Sandbox & Allow Sandbox Simulator settings.
     """
+    config = get_gateway_config()
+    allow_sim = get_payment_controls().get('allowSandboxSimulator', False)
+    if not (config.is_sandbox and allow_sim):
+        return HttpResponse(
+            "<h3>SSLCommerz Sandbox Simulator Disabled</h3><p>Enable Sandbox Mode and Allow Sandbox Simulator in Admin Panel → Payments & Gateways to use local simulation.</p>",
+            status=403,
+            content_type='text/html; charset=utf-8'
+        )
     tran_id = request.GET.get('tran_id', '')
     transaction = PaymentTransaction.objects.filter(tran_id=tran_id).first()
 
@@ -707,8 +718,9 @@ def payment_transactions_bulk_delete_view(request):
 def payment_config_view(request):
     """
     GET/POST /api/v1/payments/config
-    Retrieves or updates SSLCommerz configuration.
+    Retrieves or updates SSLCommerz configuration + Admin Sandbox Simulator toggle.
     """
+    from core.models import ShopSetting
     config = get_gateway_config()
 
     if request.method == 'POST':
@@ -728,10 +740,21 @@ def payment_config_view(request):
                 pass
         config.save()
 
+        if 'allow_sandbox_simulator' in data:
+            s = ShopSetting.get_settings()
+            extra = dict(s.extraConfig) if isinstance(s.extraConfig, dict) else {}
+            pc = dict(extra.get('paymentControls')) if isinstance(extra.get('paymentControls'), dict) else {}
+            pc['allowSandboxSimulator'] = bool(data['allow_sandbox_simulator'])
+            extra['paymentControls'] = pc
+            s.extraConfig = extra
+            s.save(update_fields=['extraConfig', 'updated_at'])
+
     serializer = PaymentGatewayConfigSerializer(config)
+    out_cfg = dict(serializer.data)
+    out_cfg['allow_sandbox_simulator'] = get_payment_controls().get('allowSandboxSimulator', False)
     return Response({
         'success': True,
-        'config': serializer.data
+        'config': out_cfg
     })
 
 

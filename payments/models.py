@@ -37,8 +37,8 @@ class PaymentTransaction(models.Model):
 class PaymentGatewayConfig(models.Model):
     gateway_id = models.CharField(max_length=32, unique=True, default='sslcommerz')
     name = models.CharField(max_length=64, default='SSLCOMMERZ Multi-Card Gateway')
-    store_id = models.CharField(max_length=128, default='testbox')
-    store_password = models.CharField(max_length=128, default='qwerty')
+    store_id = models.CharField(max_length=128, blank=True, default='')
+    store_password = models.CharField(max_length=128, blank=True, default='')
     is_sandbox = models.BooleanField(default=True)
     is_active = models.BooleanField(default=True)
     fee_percent = models.DecimalField(max_digits=4, decimal_places=2, default=2.0)
