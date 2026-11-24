@@ -23,7 +23,12 @@ def get_courier_tracking_urls(courier_provider: str, tracking_id: str, order_id:
     elif 'ecourier' in prov_lower:
         carrier_url = f"https://ecourier.com.bd/tracking?ecr={tracking_id}"
 
-    native_url = f"https://amardokan.com/track-order?id={order_id}"
+    frontend_base = (
+        os.environ.get('FRONTEND_URL')
+        or os.environ.get('APP_URL')
+        or getattr(settings, 'SSLCOMMERZ_FRONTEND_URL', '')
+    ).rstrip('/')
+    native_url = f"{frontend_base}/track-order?id={order_id}" if frontend_base else f"/track-order?id={order_id}"
 
     return {
         'carrier_url': carrier_url,
@@ -48,19 +53,19 @@ def send_order_email(order, event: str) -> dict:
 
     now_str = time.strftime('%Y-%m-%d %H:%M:%S')
 
-    # Shop Info
+    # Shop Info (Strictly read from Admin ShopSetting)
     shop_name = "AmarDokan"
-    hotline = "09612345678"
-    support_email = "support@amardokan.com"
+    hotline = ""
+    support_email = ""
     try:
         from core.models import ShopSetting
         s = ShopSetting.get_settings()
         if s.shopName:
             shop_name = s.shopName
-        if s.hotline:
-            hotline = s.hotline
-        if getattr(s, 'supportEmail', None):
-            support_email = s.supportEmail
+        if s.hotline is not None:
+            hotline = str(s.hotline).strip()
+        if getattr(s, 'supportEmail', None) is not None:
+            support_email = str(s.supportEmail).strip()
     except Exception:
         pass
 
@@ -422,13 +427,13 @@ Customer Support: {hotline} | {support_email}
             }
 
 
-def _resolve_smtp_settings(fallback_shop_name="AmarDokan"):
+def _resolve_smtp_settings(fallback_shop_name="Store"):
     """
     Resolve live SMTP connection, From email address, provider label, and enabled flag
     strictly from the central ShopSetting record.
     """
     shop_name = fallback_shop_name
-    from_email = getattr(settings, 'DEFAULT_FROM_EMAIL', f'{shop_name} <orders@amardokan.com>')
+    from_email = getattr(settings, 'DEFAULT_FROM_EMAIL', '') or getattr(settings, 'EMAIL_HOST_USER', '')
     provider_name = 'Django_Default_Email'
     email_enabled = True
     conn = None
@@ -492,36 +497,59 @@ def send_manual_notification(
     subject: str = None,
 ) -> dict:
     """
-    Sends a manual Email notification from Admin Notifications hub using live SMTP config
-    and records the result in NotificationLog.
+    Sends a manual Email notification from Admin Notifications hub or Lead Follow-Up
+    using live ShopSetting SMTP credentials and records the result in NotificationLog.
     """
-    now_str = time.strftime('%Y-%m-%d %H:%M:%S')
-    conn, from_email, prov, _, shop_name = _resolve_smtp_settings("AmarDokan")
-    email_subject = (subject or '').strip() or f"Order Notification #{order_id} - {shop_name}"
+    import html as html_lib
 
-    try:
-        msg = EmailMultiAlternatives(
-            subject=email_subject,
-            body=message_text,
-            from_email=from_email,
-            to=[recipient],
-            connection=conn,
-        )
-        safe_html_msg = str(message_text).replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
-        html_body = f"""<div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 24px; border: 1px solid #e2e8f0; border-radius: 12px; background: #ffffff;">
+    now_str = time.strftime('%Y-%m-%d %H:%M:%S')
+    conn, from_email, prov, email_enabled, shop_name = _resolve_smtp_settings("AmarDokan")
+    email_subject = (subject or '').strip() or f"Order Notification #{order_id} - {shop_name}"
+    has_env_smtp = bool(
+        (getattr(settings, 'EMAIL_HOST_USER', '') or '').strip()
+        and (getattr(settings, 'EMAIL_HOST_PASSWORD', '') or '').strip()
+    )
+
+    if not email_enabled:
+        res = {
+            'success': False,
+            'status': 'FAILED',
+            'error': 'Email notifications are disabled in Admin -> Notifications & Email.',
+            'provider': prov,
+        }
+    elif conn is None and not has_env_smtp:
+        res = {
+            'success': False,
+            'status': 'FAILED',
+            'error': 'SMTP Email Gateway is not connected yet. Configure SMTP settings in Admin -> Notifications & Email first.',
+            'provider': prov,
+        }
+    else:
+        try:
+            msg = EmailMultiAlternatives(
+                subject=email_subject,
+                body=message_text,
+                from_email=from_email or 'noreply@amardokan.com',
+                to=[recipient],
+                connection=conn,
+            )
+            safe_html_msg = html_lib.escape(str(message_text))
+            safe_shop_name = html_lib.escape(str(shop_name))
+            safe_order_id = html_lib.escape(str(order_id))
+            html_body = f"""<div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 24px; border: 1px solid #e2e8f0; border-radius: 12px; background: #ffffff;">
             <div style="border-bottom: 1px solid #f1f5f9; padding-bottom: 12px; margin-bottom: 16px;">
-                <h2 style="color: #0f172a; margin: 0; font-size: 18px;">{shop_name}</h2>
-                <span style="font-size: 12px; color: #64748b;">Order Reference: #{order_id}</span>
+                <h2 style="color: #0f172a; margin: 0; font-size: 18px;">{safe_shop_name}</h2>
+                <span style="font-size: 12px; color: #64748b;">Reference: #{safe_order_id}</span>
             </div>
             <div style="font-size: 14px; color: #334155; line-height: 1.65; white-space: pre-wrap;">{safe_html_msg}</div>
             <hr style="border: none; border-top: 1px solid #e2e8f0; margin: 20px 0;" />
-            <p style="font-size: 11px; color: #94a3b8; margin-bottom: 0;">Sent via {shop_name} Notification Hub</p>
+            <p style="font-size: 11px; color: #94a3b8; margin-bottom: 0;">Sent via {safe_shop_name} Notification Hub</p>
         </div>"""
-        msg.attach_alternative(html_body, "text/html")
-        msg.send(fail_silently=False)
-        res = {'success': True, 'status': 'SENT', 'provider': prov}
-    except Exception as e:
-        res = {'success': False, 'status': 'FAILED', 'error': str(e), 'provider': prov}
+            msg.attach_alternative(html_body, "text/html")
+            msg.send(fail_silently=False)
+            res = {'success': True, 'status': 'SENT', 'provider': prov}
+        except Exception as e:
+            res = {'success': False, 'status': 'FAILED', 'error': str(e), 'provider': prov}
 
     log_entry = NotificationLog.objects.create(
         id=f"notif-email-{int(time.time() * 1000)}",
@@ -530,14 +558,14 @@ def send_manual_notification(
         recipient=recipient,
         templateName=template_name,
         messageText=f"[{email_subject}] {message_text}",
-        status=res.get('status', 'SENT'),
+        status=res.get('status', 'FAILED'),
         timestamp=now_str,
         provider=prov,
     )
 
     return {
-        'success': res.get('success', True),
-        'status': res.get('status', 'SENT'),
+        'success': bool(res.get('success', False)),
+        'status': res.get('status', 'FAILED'),
         'provider': prov,
         'error': res.get('error'),
         'logId': log_entry.id,
