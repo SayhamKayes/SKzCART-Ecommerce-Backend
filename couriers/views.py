@@ -17,7 +17,129 @@ from core.models import AuditLog
 def couriers_list(request):
     configs = CourierConfig.objects.all()
     serializer = CourierConfigSerializer(configs, many=True)
-    return Response({'success': True, 'couriers': serializer.data})
+    webhook_sim_enabled = False
+    try:
+        from core.models import ShopSetting
+        s = ShopSetting.get_settings()
+        extra = s.extraConfig if isinstance(s.extraConfig, dict) else {}
+        controls = extra.get('courierControls') if isinstance(extra.get('courierControls'), dict) else {}
+        webhook_sim_enabled = bool(controls.get('webhookSimulatorEnabled', False))
+    except Exception:
+        webhook_sim_enabled = False
+    return Response({
+        'success': True,
+        'couriers': serializer.data,
+        'controls': {
+            'webhookSimulatorEnabled': webhook_sim_enabled,
+        },
+    })
+
+
+@api_view(['GET', 'POST'])
+@permission_classes([AllowAny])
+def courier_controls_view(request):
+    """
+    GET/POST /api/v1/couriers/controls — Manage Admin-level courier simulator toggle in central DB.
+    """
+    from core.models import ShopSetting
+    s = ShopSetting.get_settings()
+    extra = dict(s.extraConfig) if isinstance(s.extraConfig, dict) else {}
+    controls = dict(extra.get('courierControls')) if isinstance(extra.get('courierControls'), dict) else {}
+
+    if request.method == 'POST':
+        data = request.data or {}
+        if 'webhookSimulatorEnabled' in data:
+            controls['webhookSimulatorEnabled'] = bool(data['webhookSimulatorEnabled'])
+        extra['courierControls'] = controls
+        s.extraConfig = extra
+        s.save(update_fields=['extraConfig', 'updated_at'])
+        AuditLog.log(
+            actor='Admin',
+            role='ADMIN',
+            action='COURIER_CONTROLS_UPDATED',
+            target_type='SETTINGS',
+            target_id='default_shop_setting',
+            details=f"Courier Webhook Simulator {'ENABLED' if controls.get('webhookSimulatorEnabled') else 'DISABLED'}",
+            ip_address=request.META.get('REMOTE_ADDR', '127.0.0.1'),
+        )
+
+    return Response({
+        'success': True,
+        'controls': {
+            'webhookSimulatorEnabled': bool(controls.get('webhookSimulatorEnabled', False)),
+        },
+    })
+
+
+@api_view(['POST'])
+@permission_classes([AllowAny])
+def courier_mode_preset_view(request):
+    """
+    POST /api/v1/couriers/mode — One-click toggle between Testing/Sandbox Mode
+    (enables tracing test mode & Webhook Simulator) and Live Production Mode.
+    Supports { "mode": "sandbox" | "live", "provider": "all" | "<id>" }.
+    """
+    from core.models import ShopSetting
+
+    data = request.data if isinstance(request.data, dict) else {}
+    mode = str(data.get('mode') or '').strip().lower()
+    provider = str(data.get('provider') or 'all').strip().lower()
+
+    if mode not in ('sandbox', 'live'):
+        return Response({'success': False, 'message': "Mode must be 'sandbox' or 'live'."}, status=status.HTTP_400_BAD_REQUEST)
+
+    qs = CourierConfig.objects.all() if provider in ('', 'all') else CourierConfig.objects.filter(id=provider)
+    if not qs.exists():
+        return Response({'success': False, 'message': f"Courier provider '{provider}' not found."}, status=status.HTTP_404_NOT_FOUND)
+
+    is_sandbox = mode == 'sandbox'
+    for cfg in qs:
+        extra = dict(cfg.extraCredentials) if isinstance(cfg.extraCredentials, dict) else {}
+        extra['sandboxMode'] = is_sandbox
+        extra['sandboxTracing'] = is_sandbox
+        if is_sandbox:
+            extra['tracingLabel'] = f"SANDBOX-{cfg.id.upper()}"
+            cfg.isActive = True
+        else:
+            extra.pop('tracingLabel', None)
+        cfg.extraCredentials = extra
+        cfg.save(update_fields=['isActive', 'extraCredentials'])
+
+    s = ShopSetting.get_settings()
+    extra_shop = dict(s.extraConfig) if isinstance(s.extraConfig, dict) else {}
+    controls = dict(extra_shop.get('courierControls')) if isinstance(extra_shop.get('courierControls'), dict) else {}
+    if is_sandbox:
+        controls['webhookSimulatorEnabled'] = True
+    elif provider in ('', 'all'):
+        controls['webhookSimulatorEnabled'] = False
+    extra_shop['courierControls'] = controls
+    s.extraConfig = extra_shop
+    s.save(update_fields=['extraConfig', 'updated_at'])
+
+    AuditLog.log(
+        actor='Admin',
+        role='ADMIN',
+        action='COURIER_MODE_SWITCHED',
+        target_type='SETTINGS',
+        target_id=provider or 'all',
+        details=f"Switched courier environment ({provider}) to {'Sandbox Testing Mode' if is_sandbox else 'Live Production Mode'}",
+        ip_address=request.META.get('REMOTE_ADDR', '127.0.0.1'),
+    )
+
+    all_couriers = CourierConfigSerializer(CourierConfig.objects.all(), many=True).data
+    return Response({
+        'success': True,
+        'mode': mode,
+        'couriers': all_couriers,
+        'controls': {
+            'webhookSimulatorEnabled': bool(controls.get('webhookSimulatorEnabled', False)),
+        },
+        'message': (
+            "Sandbox Testing Mode & Webhook Simulator enabled!"
+            if is_sandbox
+            else "Switched to Live Production Mode. Real merchant API credentials will be used."
+        ),
+    })
 
 
 @api_view(['PUT'])
@@ -115,6 +237,8 @@ def assign_courier(request):
         order_serializer = OrderSerializer(order)
         return Response({'success': True, 'shipment': shipment, 'order': order_serializer.data})
 
+    except ValueError as e:
+        return Response({'success': False, 'message': str(e) or 'Courier credentials missing or invalid'}, status=status.HTTP_400_BAD_REQUEST)
     except Exception as e:
         return Response({'success': False, 'message': str(e) or 'Courier booking failed'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
@@ -154,19 +278,29 @@ def steadfast_check_status(request, tracking_code):
 
 
 def process_courier_webhook_data(data, ip_address='127.0.0.1'):
-    provider = data.get('provider', '').lower()
-    
-    # Check if Steadfast specific fields exist in webhook
-    if not provider and ('tracking_code' in data or 'consignment_id' in data or 'invoice' in data):
-        provider = 'steadfast'
-    if not provider:
-        provider = 'pathao'
+    if data.get('isSimulated'):
+        try:
+            from core.models import ShopSetting
+            s = ShopSetting.get_settings()
+            extra = s.extraConfig if isinstance(s.extraConfig, dict) else {}
+            controls = extra.get('courierControls') if isinstance(extra.get('courierControls'), dict) else {}
+            if not controls.get('webhookSimulatorEnabled', False):
+                return {
+                    'success': False,
+                    'status': 403,
+                    'message': 'Courier Webhook Simulator is disabled by administrator. Enable it in Admin → Courier Hub to run test webhooks.',
+                    'status_code': status.HTTP_403_FORBIDDEN,
+                }
+        except Exception:
+            pass
+
+    provider = str(data.get('provider') or '').strip().lower()
 
     invoice_val = str(
-        data.get('merchant_invoice_id') or 
-        data.get('merchant_order_id') or 
-        data.get('invoice') or 
-        data.get('order_id') or 
+        data.get('merchant_invoice_id') or
+        data.get('merchant_order_id') or
+        data.get('invoice') or
+        data.get('order_id') or
         data.get('orderId') or ''
     ).strip()
     tracking_val = str(data.get('tracking_code') or data.get('tracking_id') or data.get('trackingId') or '').strip()
@@ -191,6 +325,22 @@ def process_courier_webhook_data(data, ip_address='127.0.0.1'):
     if not order:
         lookup_ref = invoice_val or tracking_val or consignment_val
         return {'success': True, 'acknowledged': True, 'message': f"Webhook acknowledged. Order not found for reference: {lookup_ref}", 'status_code': status.HTTP_200_OK}
+
+    # Resolve courier provider from URL/payload, matched order.courier, or provider payload signature
+    if not provider and isinstance(order.courier, dict) and order.courier.get('provider'):
+        provider = str(order.courier.get('provider')).strip().lower()
+    if not provider:
+        ev_str = str(data.get('event') or '').lower()
+        if ev_str.startswith('order.'):
+            provider = 'pathao'
+        elif 'parcel' in data or 'parcel_status' in data:
+            provider = 'redx'
+        elif 'query_data' in data:
+            provider = 'ecourier'
+        elif 'tracking_code' in data or 'consignment_id' in data or 'invoice' in data:
+            provider = 'steadfast'
+        else:
+            provider = 'pathao'
 
     adapter = courier_adapters.get(provider) or courier_adapters.get('steadfast')
     if not adapter:
@@ -352,6 +502,8 @@ def sync_order_courier_status(request, order_id):
     raw_payload['order_id'] = order.id
     raw_payload['tracking_id'] = order.courier.get('trackingId')
 
+    q_data = raw_payload.get('query_data') if isinstance(raw_payload.get('query_data'), list) else []
+    latest_q = q_data[0] if (q_data and isinstance(q_data[0], dict)) else {}
     raw_status_text = str(
         raw_payload.get('delivery_status')
         or raw_payload.get('order_status')
@@ -359,6 +511,7 @@ def sync_order_courier_status(request, order_id):
         or raw_payload.get('status')
         or (raw_payload.get('data', {}).get('order_status') if isinstance(raw_payload.get('data'), dict) else '')
         or (raw_payload.get('parcel', {}).get('status') if isinstance(raw_payload.get('parcel'), dict) else '')
+        or latest_q.get('status')
         or ''
     ).strip()
 

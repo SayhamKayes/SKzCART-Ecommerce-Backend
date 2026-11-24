@@ -8,9 +8,39 @@ from core.utils import normalize_bangladesh_phone
 logger = logging.getLogger(__name__)
 
 class BaseCourierAdapter:
+    LEGACY_PLACEHOLDER_KEYS = {
+        '',
+        'pk_live_pathao_merchant_92813',
+        'ps_secret_key_847192738',
+        'stf_live_api_88492010',
+        'stf_sec_019283849',
+        'redx_token_live_738192',
+        'redx_hash_918237',
+        'ec_usr_849201',
+        'ec_key_192837',
+    }
+
     def __init__(self, provider_id, name):
         self.provider_id = provider_id
         self.name = name
+
+    def get_provider_config(self):
+        from .models import CourierConfig
+        return CourierConfig.objects.filter(id=self.provider_id).first()
+
+    def has_live_credential(self, value):
+        cleaned = str(value or '').strip()
+        return bool(cleaned and cleaned not in self.LEGACY_PLACEHOLDER_KEYS)
+
+    def is_sandbox_mode(self, config=None):
+        cfg = config or self.get_provider_config()
+        extra = cfg.extraCredentials if (cfg and isinstance(cfg.extraCredentials, dict)) else {}
+        return bool(extra.get('sandboxMode', False))
+
+    def get_dynamic_fee(self, config, is_dhaka):
+        if config:
+            return int(config.insideDhakaRate or 0) if is_dhaka else int(config.outsideDhakaRate or 0)
+        return 0
 
     def create_shipment(self, order, item_weight_kg=0.5, special_instruction=""):
         raise NotImplementedError
@@ -88,18 +118,20 @@ class PathaoAdapter(BaseCourierAdapter):
         client_secret = (config.secret if config and config.secret else '') or os.getenv('PATHAO_CLIENT_SECRET', '')
         username = extra.get('username') or os.getenv('PATHAO_USERNAME', '')
         password = extra.get('password') or os.getenv('PATHAO_PASSWORD', '')
-        store_id = str(extra.get('store_id') or os.getenv('PATHAO_STORE_ID', '1')).strip() or '1'
-        return client_id.strip(), client_secret.strip(), str(username).strip(), str(password).strip(), store_id
+        store_id = str(extra.get('store_id') or os.getenv('PATHAO_STORE_ID', '')).strip()
+        use_official_sandbox = bool(extra.get('useOfficialSandbox', False))
+        base_url = self.SANDBOX_URL if use_official_sandbox else self.BASE_URL
+        return client_id.strip(), client_secret.strip(), str(username).strip(), str(password).strip(), store_id, base_url
 
     def get_access_token(self):
-        client_id, client_secret, username, password, _ = self.get_credentials()
+        client_id, client_secret, username, password, _, base_url = self.get_credentials()
 
         if not (client_id and client_secret and username and password):
             return None, "Pathao requires Client ID, Client Secret, Account Username/Email, and Password."
 
         try:
             resp = requests.post(
-                f"{self.BASE_URL}/aladdin/api/v1/issue-token",
+                f"{base_url}/aladdin/api/v1/issue-token",
                 json={
                     "client_id": client_id,
                     "client_secret": client_secret,
@@ -119,30 +151,52 @@ class PathaoAdapter(BaseCourierAdapter):
             logger.error(f"Pathao issue-token failed: {e}")
             return None, f"Pathao connection error: {str(e)}"
 
+    def resolve_default_store_id(self, token, base_url, configured_store_id):
+        if configured_store_id and str(configured_store_id).isdigit():
+            return int(configured_store_id)
+        try:
+            resp = requests.get(
+                f"{base_url}/aladdin/api/v1/stores",
+                headers={"Authorization": f"Bearer {token}", "Accept": "application/json"},
+                timeout=8,
+            )
+            if resp.status_code == 200:
+                stores = resp.json().get('data', {}).get('data', [])
+                if isinstance(stores, list) and len(stores) > 0:
+                    return int(stores[0].get('store_id') or 1)
+        except Exception as e:
+            logger.warning(f"Pathao store list lookup failed: {e}")
+        return 1
+
     def create_shipment(self, order, item_weight_kg=0.5, special_instruction=""):
-        client_id, client_secret, _, _, store_id = self.get_credentials()
+        config = self.get_provider_config()
+        sandbox_mode = self.is_sandbox_mode(config)
+        client_id, client_secret, _, _, store_id, base_url = self.get_credentials()
         district = order.address.get('district', '') if isinstance(order.address, dict) else ''
         is_dhaka = str(district).strip().lower() == 'dhaka'
-        delivery_fee = 60 if is_dhaka else 130
+        delivery_fee = self.get_dynamic_fee(config, is_dhaka)
         cod_amount = order.total if order.paymentMethod == 'COD' else 0
 
         address_dict = order.address if isinstance(order.address, dict) else {}
         recipient_name = address_dict.get('customerName') or 'Valued Customer'
         raw_phone = address_dict.get('phone') or ''
         recipient_phone = normalize_bangladesh_phone(raw_phone)
-        full_address = address_dict.get('fullAddress') or f"{address_dict.get('thana', '')}, {district}"
+        full_address = address_dict.get('fullAddress') or f"{address_dict.get('thana', '')}, {district}".strip(', ')
         note = special_instruction or address_dict.get('orderNote') or 'Please call before delivery.'
 
-        is_mock_key = client_id in ['', 'pk_live_pathao_merchant_92813'] or client_secret in ['', 'ps_secret_key_847192738']
+        has_live_creds = self.has_live_credential(client_id) and self.has_live_credential(client_secret)
 
-        # If live credentials exist, attempt real Pathao API call (fail loudly instead of faking if auth/booking fails)
-        if not is_mock_key:
+        # Strict Live Production mode when sandbox_mode is False
+        if not sandbox_mode:
+            if not has_live_creds:
+                raise ValueError("Pathao live API credentials are missing. Add real credentials or enable Sandbox Mode in Admin → Courier Hub.")
             token, auth_err = self.get_access_token()
             if not token:
                 raise ValueError(auth_err or "Pathao authentication failed. Check Pathao credentials in Courier Hub.")
-            city_id, zone_id = self.resolve_city_zone(token, district, address_dict.get('thana', ''))
+            resolved_store_id = self.resolve_default_store_id(token, base_url, store_id)
+            city_id, zone_id = self.resolve_city_zone(token, district, address_dict.get('thana', ''), base_url=base_url)
             payload = {
-                "store_id": int(store_id) if str(store_id).isdigit() else 1,
+                "store_id": resolved_store_id,
                 "merchant_order_id": str(order.id),
                 "recipient_name": recipient_name,
                 "recipient_phone": recipient_phone,
@@ -159,7 +213,7 @@ class PathaoAdapter(BaseCourierAdapter):
             if True:
                 try:
                     resp = requests.post(
-                        f"{self.BASE_URL}/aladdin/api/v1/orders",
+                        f"{base_url}/aladdin/api/v1/orders",
                         json=payload,
                         headers={
                             "Authorization": f"Bearer {token}",
@@ -196,35 +250,45 @@ class PathaoAdapter(BaseCourierAdapter):
                     logger.error(f"Pathao network error: {e}")
                     raise ConnectionError(f"Pathao connection failed: {str(e)}")
 
-        # Sandbox / Demonstration Fallback
+        # Sandbox Testing Fallback
         prefix = (district[:3].upper() if len(district) >= 3 else 'DHK')
         tracking_id = f"PTH-{prefix}-{random.randint(100000, 999999)}"
         consignment_id = f"PTH-CNS-{random.randint(1000000, 9999999)}"
-        rider_suffix = random.randint(100000, 999999)
 
         return {
             'provider': 'pathao',
             'trackingId': tracking_id,
             'consignmentId': consignment_id,
-            'courierStatus': 'Order Placed at Pathao Hub (Sandbox/Demo)',
+            'courierStatus': 'Order Placed at Pathao Hub (Sandbox Testing)',
             'createdDate': timezone.localtime().strftime('%Y-%m-%d %I:%M %p'),
             'deliveryFee': delivery_fee,
             'codAmount': cod_amount,
             'trackingUrl': f"https://pathao.com/courier/tracking?consignment={consignment_id}",
-            'hubLocation': 'Tejgaon Central Sorting Hub' if is_dhaka else 'Dhaka Transit Departure Hub',
-            'assignedRiderName': 'Pathao Fleet Agent',
-            'assignedRiderPhone': f"01700{rider_suffix}",
+            'hubLocation': 'Tejgaon Central Sorting Hub' if is_dhaka else 'Regional Sorting Hub',
+            'assignedRiderName': 'Pathao Fleet Agent (Sandbox)',
+            'assignedRiderPhone': '',
             'liveApi': False,
         }
 
     def get_balance(self):
-        client_id, client_secret, _, _, _ = self.get_credentials()
-        if not client_id or client_id == 'pk_live_pathao_merchant_92813' or client_secret in ['', 'ps_secret_key_847192738']:
+        config = self.get_provider_config()
+        sandbox_mode = self.is_sandbox_mode(config)
+        client_id, client_secret, _, _, _, _ = self.get_credentials()
+        has_live = self.has_live_credential(client_id) and self.has_live_credential(client_secret)
+        if sandbox_mode:
             return {
                 'success': True,
                 'isDemo': True,
-                'current_balance': 12650,
-                'message': 'Demo Pathao Remittance Balance (Configure live Client ID, Secret, Email & Password in settings)'
+                'sandboxMode': True,
+                'current_balance': 0,
+                'message': 'Sandbox Testing Mode Active — No live Pathao API call made.'
+            }
+        if not has_live:
+            return {
+                'success': False,
+                'isDemo': False,
+                'current_balance': 0,
+                'message': 'Pathao API credentials missing. Configure Client ID, Secret, Email & Password (or enable Sandbox Mode).'
             }
         token, auth_err = self.get_access_token()
         if not token:
@@ -242,8 +306,9 @@ class PathaoAdapter(BaseCourierAdapter):
             'message': 'Pathao OAuth2 live token authenticated successfully (Pathao API does not expose wallet balance endpoint).'
         }
 
-    def resolve_city_zone(self, token, district, thana=""):
-        """Dynamically resolve Pathao city_id & zone_id from district/thana, falling back safely to Dhaka (1, 1)."""
+    def resolve_city_zone(self, token, district, thana="", base_url=None):
+        """Dynamically resolve Pathao city_id & zone_id from district/thana."""
+        api_base = base_url or self.BASE_URL
         city_id, zone_id = 1, 1
         d_clean = str(district or '').strip().lower()
         t_clean = str(thana or '').strip().lower()
@@ -251,14 +316,14 @@ class PathaoAdapter(BaseCourierAdapter):
             return city_id, zone_id
         try:
             headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
-            c_resp = requests.get(f"{self.BASE_URL}/aladdin/api/v1/city-list", headers=headers, timeout=8)
+            c_resp = requests.get(f"{api_base}/aladdin/api/v1/city-list", headers=headers, timeout=8)
             c_data = c_resp.json().get('data', {}).get('data', []) if c_resp.status_code == 200 else []
             for c in c_data:
                 if d_clean in str(c.get('city_name', '')).lower():
                     city_id = int(c.get('city_id', 1))
                     break
             if t_clean:
-                z_resp = requests.get(f"{self.BASE_URL}/aladdin/api/v1/cities/{city_id}/zone-list", headers=headers, timeout=8)
+                z_resp = requests.get(f"{api_base}/aladdin/api/v1/cities/{city_id}/zone-list", headers=headers, timeout=8)
                 z_data = z_resp.json().get('data', {}).get('data', []) if z_resp.status_code == 200 else []
                 for z in z_data:
                     if t_clean in str(z.get('zone_name', '')).lower():
@@ -271,15 +336,19 @@ class PathaoAdapter(BaseCourierAdapter):
         return city_id, zone_id
 
     def check_status(self, tracking_code):
-        client_id, client_secret, _, _, _ = self.get_credentials()
-        if not client_id or client_id == 'pk_live_pathao_merchant_92813':
+        config = self.get_provider_config()
+        sandbox_mode = self.is_sandbox_mode(config)
+        client_id, client_secret, _, _, _, base_url = self.get_credentials()
+        if sandbox_mode:
             return {'status': 200, 'tracking_id': tracking_code, 'provider': 'pathao', 'isDemo': True}
+        if not (self.has_live_credential(client_id) and self.has_live_credential(client_secret)):
+            return {'status': 400, 'isDemo': False, 'message': 'Pathao live API credentials not configured.'}
         token, auth_err = self.get_access_token()
         if not token:
             return {'status': 401, 'message': auth_err or 'Pathao authentication failed'}
         try:
             resp = requests.get(
-                f"{self.BASE_URL}/aladdin/api/v1/orders/{tracking_code}/info",
+                f"{base_url}/aladdin/api/v1/orders/{tracking_code}/info",
                 headers={"Authorization": f"Bearer {token}", "Accept": "application/json"},
                 timeout=10
             )
@@ -303,27 +372,62 @@ class PathaoAdapter(BaseCourierAdapter):
             or payload.get('order_status_slug')
             or payload.get('status')
             or nested.get('order_status')
+            or nested.get('order_status_slug')
             or ''
         ).lower().strip()
         mapping = {
-            'order.delivered': ('DELIVERED', 'Parcel successfully delivered to recipient (Pathao)'),
-            'delivered': ('DELIVERED', 'Parcel successfully delivered to recipient (Pathao)'),
-            'order.in_transit': ('IN_TRANSIT', 'Parcel in transit to destination hub (Pathao)'),
-            'in_transit': ('IN_TRANSIT', 'Parcel in transit to destination hub (Pathao)'),
-            'order.picked_up': ('PICKED_UP', 'Rider picked up parcel from merchant (Pathao)'),
-            'picked_up': ('PICKED_UP', 'Rider picked up parcel from merchant (Pathao)'),
+            # Pathao Webhook official dot-hyphen events + REST API statuses
+            'order.created': ('COURIER_CREATED', 'Order created in Pathao portal'),
+            'order.updated': ('COURIER_CREATED', 'Order updated in Pathao portal'),
+            'order.pickup-requested': ('COURIER_CREATED', 'Pickup requested at Pathao hub'),
+            'order.assigned-for-pickup': ('COURIER_CREATED', 'Pathao rider assigned for pickup'),
             'pickup_requested': ('COURIER_CREATED', 'Pickup requested at Pathao hub'),
+            'pickup requested': ('COURIER_CREATED', 'Pickup requested at Pathao hub'),
+            'assigned for pickup': ('COURIER_CREATED', 'Pathao rider assigned for pickup'),
+            'order.picked': ('PICKED_UP', 'Rider picked up parcel from merchant (Pathao)'),
+            'order.picked-up': ('PICKED_UP', 'Rider picked up parcel from merchant (Pathao)'),
+            'order.picked_up': ('PICKED_UP', 'Rider picked up parcel from merchant (Pathao)'),
+            'picked': ('PICKED_UP', 'Rider picked up parcel from merchant (Pathao)'),
+            'picked_up': ('PICKED_UP', 'Rider picked up parcel from merchant (Pathao)'),
+            'picked up': ('PICKED_UP', 'Rider picked up parcel from merchant (Pathao)'),
+            'order.at-the-sorting-hub': ('IN_TRANSIT', 'Parcel arrived at Pathao sorting hub'),
+            'order.in-transit': ('IN_TRANSIT', 'Parcel in transit to destination hub (Pathao)'),
+            'order.in_transit': ('IN_TRANSIT', 'Parcel in transit to destination hub (Pathao)'),
+            'order.received-at-last-mile-hub': ('IN_TRANSIT', 'Parcel received at destination hub (Pathao)'),
+            'order.on-hold': ('IN_TRANSIT', 'Parcel temporarily on hold (Pathao)'),
+            'at the sorting hub': ('IN_TRANSIT', 'Parcel arrived at Pathao sorting hub'),
+            'received at last mile hub': ('IN_TRANSIT', 'Parcel received at destination hub (Pathao)'),
+            'in_transit': ('IN_TRANSIT', 'Parcel in transit to destination hub (Pathao)'),
+            'in transit': ('IN_TRANSIT', 'Parcel in transit to destination hub (Pathao)'),
+            'on_hold': ('IN_TRANSIT', 'Parcel temporarily on hold (Pathao)'),
+            'on hold': ('IN_TRANSIT', 'Parcel temporarily on hold (Pathao)'),
+            'hold': ('IN_TRANSIT', 'Parcel temporarily on hold (Pathao)'),
+            'order.assigned-for-delivery': ('OUT_FOR_DELIVERY', 'Rider assigned and out for delivery (Pathao)'),
+            'order.out-for-delivery': ('OUT_FOR_DELIVERY', 'Rider out for delivery to recipient (Pathao)'),
             'order.out_for_delivery': ('OUT_FOR_DELIVERY', 'Rider out for delivery to recipient (Pathao)'),
+            'assigned for delivery': ('OUT_FOR_DELIVERY', 'Rider assigned and out for delivery (Pathao)'),
             'out_for_delivery': ('OUT_FOR_DELIVERY', 'Rider out for delivery to recipient (Pathao)'),
+            'out for delivery': ('OUT_FOR_DELIVERY', 'Rider out for delivery to recipient (Pathao)'),
+            'order.delivered': ('DELIVERED', 'Parcel successfully delivered to recipient (Pathao)'),
+            'order.partial-delivery': ('DELIVERED', 'Parcel partially delivered (Pathao)'),
+            'delivered': ('DELIVERED', 'Parcel successfully delivered to recipient (Pathao)'),
+            'partial delivery': ('DELIVERED', 'Parcel partially delivered (Pathao)'),
+            'partial_delivered': ('DELIVERED', 'Parcel partially delivered (Pathao)'),
+            'order.return': ('RETURNED', 'Parcel returned to merchant (Pathao)'),
             'order.returned': ('RETURNED', 'Parcel returned to merchant (Pathao)'),
+            'order.delivery-failed': ('RETURNED', 'Delivery failed, returning parcel (Pathao)'),
+            'return': ('RETURNED', 'Parcel returned to merchant (Pathao)'),
             'returned': ('RETURNED', 'Parcel returned to merchant (Pathao)'),
+            'delivery failed': ('RETURNED', 'Delivery failed, returning parcel (Pathao)'),
+            'order.pickup-cancelled': ('CANCELLED', 'Pickup cancelled (Pathao)'),
             'order.cancelled': ('CANCELLED', 'Parcel booking cancelled (Pathao)'),
+            'pickup cancelled': ('CANCELLED', 'Pickup cancelled (Pathao)'),
             'cancelled': ('CANCELLED', 'Parcel booking cancelled (Pathao)'),
         }
-        order_status, notes = mapping.get(event, ('IN_TRANSIT', f"Pathao status updated: {event}"))
+        order_status, notes = mapping.get(event, ('IN_TRANSIT', f"Pathao status updated: {event.replace('_', ' ').replace('-', ' ').strip()}"))
         return {
             'orderStatus': order_status,
-            'collectedAmount': payload.get('collected_amount') or payload.get('cod_amount') or 0,
+            'collectedAmount': payload.get('collected_amount') or payload.get('cod_amount') or nested.get('collected_amount') or 0,
             'notes': notes,
         }
 
@@ -350,10 +454,12 @@ class SteadfastAdapter(BaseCourierAdapter):
         }
 
     def create_shipment(self, order, item_weight_kg=0.5, special_instruction=""):
+        config = self.get_provider_config()
+        sandbox_mode = self.is_sandbox_mode(config)
         api_key, secret_key = self.get_credentials()
         district = order.address.get('district', '') if isinstance(order.address, dict) else ''
         is_dhaka = str(district).strip().lower() == 'dhaka'
-        delivery_fee = 60 if is_dhaka else 130
+        delivery_fee = self.get_dynamic_fee(config, is_dhaka)
         cod_amount = order.total if order.paymentMethod == 'COD' else 0
 
         address_dict = order.address if isinstance(order.address, dict) else {}
@@ -363,10 +469,11 @@ class SteadfastAdapter(BaseCourierAdapter):
         full_address = address_dict.get('fullAddress') or f"{address_dict.get('thana', '')}, {district}"
         note = special_instruction or address_dict.get('orderNote') or 'Please call before delivery.'
 
-        is_mock_key = api_key in ['', 'stf_live_api_88492010'] or secret_key in ['', 'stf_sec_019283849']
+        has_live = self.has_live_credential(api_key) and self.has_live_credential(secret_key)
 
-        # If a real merchant key is provided, execute real HTTP POST request to Steadfast
-        if not is_mock_key:
+        if not sandbox_mode:
+            if not has_live:
+                raise ValueError("Steadfast live API credentials are missing. Configure API Key & Secret or enable Sandbox Mode in Admin → Courier Hub.")
             payload = {
                 'invoice': str(order.id),
                 'recipient_name': recipient_name,
@@ -410,34 +517,43 @@ class SteadfastAdapter(BaseCourierAdapter):
                 logger.error(f"Steadfast network error: {e}")
                 raise ConnectionError(f"Steadfast connection failed: {str(e)}")
 
-        # Sandbox / Demonstration Fallback
+        # Sandbox Testing Fallback
         tracking_id = f"STDF-{random.randint(20000000, 99999999)}"
         consignment_id = f"CID-{random.randint(100000, 999999)}"
-        rider_suffix = random.randint(100000, 999999)
 
         return {
             'provider': 'steadfast',
             'trackingId': tracking_id,
             'consignmentId': consignment_id,
-            'courierStatus': 'Consignment Created at Steadfast (Sandbox/Demo)',
+            'courierStatus': 'Consignment Created at Steadfast (Sandbox Testing)',
             'createdDate': timezone.localtime().strftime('%Y-%m-%d %I:%M %p'),
             'deliveryFee': delivery_fee,
             'codAmount': cod_amount,
             'trackingUrl': f"https://steadfast.com.bd/tracking/{tracking_id}",
             'hubLocation': 'Motijheel Distribution Hub' if is_dhaka else 'District Delivery Station',
-            'assignedRiderName': 'Steadfast Express Executive',
-            'assignedRiderPhone': f"01811{rider_suffix}",
+            'assignedRiderName': 'Steadfast Express Executive (Sandbox)',
+            'assignedRiderPhone': '',
             'liveApi': False,
         }
 
     def get_balance(self):
+        config = self.get_provider_config()
+        sandbox_mode = self.is_sandbox_mode(config)
         api_key, secret_key = self.get_credentials()
-        if not api_key or api_key == 'stf_live_api_88492010':
+        if sandbox_mode:
             return {
                 'success': True,
                 'isDemo': True,
-                'current_balance': 14850,
-                'message': 'Demo Steadfast Balance (Configure your real API key in settings)'
+                'sandboxMode': True,
+                'current_balance': 0,
+                'message': 'Sandbox Testing Mode Active — No live Steadfast API call made.'
+            }
+        if not (self.has_live_credential(api_key) and self.has_live_credential(secret_key)):
+            return {
+                'success': False,
+                'isDemo': False,
+                'current_balance': 0,
+                'message': 'Steadfast API credentials missing. Configure API Key & Secret (or enable Sandbox Mode).'
             }
         try:
             resp = requests.get(
@@ -461,6 +577,13 @@ class SteadfastAdapter(BaseCourierAdapter):
             return {'success': False, 'message': str(e)}
 
     def check_status(self, tracking_code):
+        config = self.get_provider_config()
+        sandbox_mode = self.is_sandbox_mode(config)
+        api_key, secret_key = self.get_credentials()
+        if sandbox_mode:
+            return {'status': 200, 'tracking_id': tracking_code, 'provider': 'steadfast', 'isDemo': True}
+        if not (self.has_live_credential(api_key) and self.has_live_credential(secret_key)):
+            return {'status': 400, 'isDemo': False, 'message': 'Steadfast live API credentials not configured.'}
         try:
             resp = requests.get(
                 f"{self.BASE_URL}/status_by_trackingcode/{tracking_code}",
@@ -479,21 +602,30 @@ class SteadfastAdapter(BaseCourierAdapter):
             or payload.get('event')
             or ''
         ).lower().strip()
+        tracking_msg = str(payload.get('tracking_message') or '').strip()
         mapping = {
             'delivered': ('DELIVERED', 'Parcel successfully delivered to recipient (Steadfast)'),
             'partial_delivered': ('DELIVERED', 'Parcel partially delivered (Steadfast)'),
             'delivered_approval_pending': ('DELIVERED', 'Delivered, pending settlement approval (Steadfast)'),
+            'partial_delivered_approval_pending': ('DELIVERED', 'Partially delivered, pending settlement approval (Steadfast)'),
             'cancelled': ('CANCELLED', 'Parcel booking cancelled (Steadfast)'),
+            'cancelled_approval_pending': ('CANCELLED', 'Cancellation pending approval (Steadfast)'),
             'hold': ('IN_TRANSIT', 'Parcel temporarily held at Steadfast hub'),
             'in_review': ('COURIER_CREATED', 'Consignment created and under review (Steadfast)'),
             'pending': ('COURIER_CREATED', 'Awaiting rider pickup (Steadfast)'),
+            'awaiting_pickup': ('COURIER_CREATED', 'Awaiting rider pickup (Steadfast)'),
             'picked_up': ('PICKED_UP', 'Rider picked up parcel from merchant hub (Steadfast)'),
+            'picked up': ('PICKED_UP', 'Rider picked up parcel from merchant hub (Steadfast)'),
             'in_transit': ('IN_TRANSIT', 'Parcel in transit to destination hub (Steadfast)'),
+            'in transit': ('IN_TRANSIT', 'Parcel in transit to destination hub (Steadfast)'),
             'out_for_delivery': ('OUT_FOR_DELIVERY', 'Delivery rider is out for delivery (Steadfast)'),
-            'return': ('RETURNED', 'Parcel returned as recipient was unavailable'),
+            'out for delivery': ('OUT_FOR_DELIVERY', 'Delivery rider is out for delivery (Steadfast)'),
+            'return': ('RETURNED', 'Parcel returned to merchant (Steadfast)'),
             'returned': ('RETURNED', 'Parcel returned to merchant (Steadfast)'),
+            'unknown': ('IN_TRANSIT', tracking_msg or 'Awaiting courier status update (Steadfast)'),
+            'unknown_approval_pending': ('IN_TRANSIT', tracking_msg or 'Status update pending review (Steadfast)'),
         }
-        order_status, notes = mapping.get(raw_status, ('IN_TRANSIT', f"Steadfast status updated: {raw_status}"))
+        order_status, notes = mapping.get(raw_status, ('IN_TRANSIT', tracking_msg or f"Steadfast status updated: {raw_status.replace('_', ' ').replace('-', ' ').strip()}"))
         return {
             'orderStatus': order_status,
             'collectedAmount': payload.get('cod_amount') or payload.get('collected_amount') or 0,
@@ -512,31 +644,67 @@ class RedxAdapter(BaseCourierAdapter):
         config = CourierConfig.objects.filter(id='redx').first()
         extra = (config.extraCredentials if config and isinstance(config.extraCredentials, dict) else {})
         token = (config.apiKey if config and config.apiKey else '') or os.getenv('REDX_API_TOKEN', '')
-        area_id = int(extra.get('delivery_area_id') or 1) if str(extra.get('delivery_area_id') or '').isdigit() else 1
+        raw_area = str(extra.get('delivery_area_id') or '').strip()
+        area_id = int(raw_area) if raw_area.isdigit() else None
         return token.strip(), area_id
 
+    def resolve_area(self, token, district, thana="", configured_area_id=None):
+        """Dynamically resolve RedX delivery_area_id from /areas endpoint using thana/district."""
+        if configured_area_id:
+            return configured_area_id, (thana or district or "Bangladesh")
+        t_clean = str(thana or '').strip().lower()
+        d_clean = str(district or '').strip().lower()
+        try:
+            url = f"{self.BASE_URL}/areas"
+            params = {'district_name': district} if district else {}
+            resp = requests.get(url, params=params, headers={"Authorization": f"Bearer {token}"}, timeout=8)
+            if resp.status_code != 200 and params:
+                resp = requests.get(url, headers={"Authorization": f"Bearer {token}"}, timeout=8)
+            areas = resp.json().get('areas', []) if resp.status_code == 200 and resp.text else []
+            if isinstance(areas, list):
+                if t_clean:
+                    for a in areas:
+                        aname = str(a.get('name') or a.get('area_name') or '').lower()
+                        if t_clean in aname or aname in t_clean:
+                            return int(a.get('id') or 1), str(a.get('name') or thana or district)
+                if d_clean:
+                    for a in areas:
+                        dist_str = str(a.get('district_name') or a.get('zone_name') or a.get('name') or '').lower()
+                        if d_clean in dist_str:
+                            return int(a.get('id') or 1), str(a.get('name') or district)
+                if areas:
+                    return int(areas[0].get('id') or 1), str(areas[0].get('name') or district or "Bangladesh")
+        except Exception as e:
+            logger.warning(f"RedX area lookup fallback for {district}/{thana}: {e}")
+        return 1, (thana or district or "Bangladesh")
+
     def create_shipment(self, order, item_weight_kg=0.5, special_instruction=""):
-        token, delivery_area_id = self.get_credentials()
+        config = self.get_provider_config()
+        sandbox_mode = self.is_sandbox_mode(config)
+        token, configured_area_id = self.get_credentials()
         district = order.address.get('district', '') if isinstance(order.address, dict) else ''
+        thana = order.address.get('thana', '') if isinstance(order.address, dict) else ''
         is_dhaka = str(district).strip().lower() == 'dhaka'
-        delivery_fee = 60 if is_dhaka else 130
+        delivery_fee = self.get_dynamic_fee(config, is_dhaka)
         cod_amount = order.total if order.paymentMethod == 'COD' else 0
 
         address_dict = order.address if isinstance(order.address, dict) else {}
         recipient_name = address_dict.get('customerName') or 'Valued Customer'
         raw_phone = address_dict.get('phone') or ''
         recipient_phone = normalize_bangladesh_phone(raw_phone)
-        full_address = address_dict.get('fullAddress') or f"{address_dict.get('thana', '')}, {district}"
+        full_address = address_dict.get('fullAddress') or f"{thana}, {district}".strip(', ')
         note = special_instruction or address_dict.get('orderNote') or 'Please call before delivery.'
 
-        is_mock_key = token in ['', 'redx_token_live_738192']
+        has_live = self.has_live_credential(token)
 
-        # If live token configured, execute real RedX API request
-        if not is_mock_key:
+        if not sandbox_mode:
+            if not has_live:
+                raise ValueError("RedX live API token is missing. Configure API Token or enable Sandbox Mode in Admin → Courier Hub.")
+            delivery_area_id, area_label = self.resolve_area(token, district, thana, configured_area_id)
             payload = {
                 "customer_name": recipient_name,
                 "customer_phone": recipient_phone,
-                "delivery_area": district or "Dhaka",
+                "delivery_area": area_label,
                 "delivery_area_id": delivery_area_id,
                 "customer_address": full_address,
                 "merchant_invoice_id": str(order.id),
@@ -581,34 +749,43 @@ class RedxAdapter(BaseCourierAdapter):
                 logger.error(f"RedX network error: {e}")
                 raise ConnectionError(f"RedX connection failed: {str(e)}")
 
-        # Sandbox / Demonstration Fallback
+        # Sandbox Testing Fallback
         tracking_id = f"REDX-{random.randint(100000000, 999999999)}"
         consignment_id = f"RC-{random.randint(100000, 999999)}"
-        rider_suffix = random.randint(100000, 999999)
 
         return {
             'provider': 'redx',
             'trackingId': tracking_id,
             'consignmentId': consignment_id,
-            'courierStatus': 'Consignment Booked in RedX Network (Sandbox/Demo)',
+            'courierStatus': 'Consignment Booked in RedX Network (Sandbox Testing)',
             'createdDate': timezone.localtime().strftime('%Y-%m-%d %I:%M %p'),
             'deliveryFee': delivery_fee,
             'codAmount': cod_amount,
             'trackingUrl': f"https://redx.com.bd/track/{tracking_id}",
             'hubLocation': 'Gazipur Central Fulfilment' if is_dhaka else 'Regional Logistics Node',
-            'assignedRiderName': 'RedX Delivery Rider',
-            'assignedRiderPhone': f"01912{rider_suffix}",
+            'assignedRiderName': 'RedX Delivery Rider (Sandbox)',
+            'assignedRiderPhone': '',
             'liveApi': False,
         }
 
     def get_balance(self):
+        config = self.get_provider_config()
+        sandbox_mode = self.is_sandbox_mode(config)
         token, _ = self.get_credentials()
-        if not token or token == 'redx_token_live_738192':
+        if sandbox_mode:
             return {
                 'success': True,
                 'isDemo': True,
-                'current_balance': 6820,
-                'message': 'Demo RedX Wallet Balance (Configure API Token in settings)'
+                'sandboxMode': True,
+                'current_balance': 0,
+                'message': 'Sandbox Testing Mode Active — No live RedX API call made.'
+            }
+        if not self.has_live_credential(token):
+            return {
+                'success': False,
+                'isDemo': False,
+                'current_balance': 0,
+                'message': 'RedX API token missing. Configure API Token (or enable Sandbox Mode).'
             }
         try:
             resp = requests.get(
@@ -633,16 +810,34 @@ class RedxAdapter(BaseCourierAdapter):
             return {'success': False, 'isDemo': False, 'message': str(e)}
 
     def check_status(self, tracking_code):
+        config = self.get_provider_config()
+        sandbox_mode = self.is_sandbox_mode(config)
         token, _ = self.get_credentials()
-        if not token or token == 'redx_token_live_738192':
-            return {'status': 200, 'tracking_id': tracking_code, 'provider': 'redx'}
+        if sandbox_mode:
+            return {'status': 200, 'tracking_id': tracking_code, 'provider': 'redx', 'isDemo': True}
+        if not self.has_live_credential(token):
+            return {'status': 400, 'isDemo': False, 'message': 'RedX live API token not configured.'}
         try:
             resp = requests.get(
-                f"{self.BASE_URL}/parcels/{tracking_code}",
+                f"{self.BASE_URL}/parcel/info/{tracking_code}",
                 headers={"Authorization": f"Bearer {token}"},
                 timeout=10
             )
-            return resp.json() if resp.text else {'status': resp.status_code}
+            if resp.status_code == 404:
+                resp = requests.get(
+                    f"{self.BASE_URL}/parcels/{tracking_code}",
+                    headers={"Authorization": f"Bearer {token}"},
+                    timeout=10
+                )
+            data = resp.json() if resp.text else {'status': resp.status_code}
+            parcel = data.get('parcel') if isinstance(data.get('parcel'), dict) else {}
+            return {
+                'status': resp.status_code,
+                'provider': 'redx',
+                'tracking_id': tracking_code,
+                'parcel_status': parcel.get('status') or data.get('status') or '',
+                'raw': data,
+            }
         except Exception as e:
             return {'status': 500, 'message': str(e)}
 
@@ -656,19 +851,40 @@ class RedxAdapter(BaseCourierAdapter):
             or ''
         ).lower().strip()
         mapping = {
-            'delivered': ('DELIVERED', 'Parcel successfully delivered to recipient (RedX)'),
-            'in_transit': ('IN_TRANSIT', 'Parcel in RedX transit hub'),
-            'pickup_completed': ('PICKED_UP', 'RedX rider picked up parcel from merchant'),
+            'pickup-pending': ('COURIER_CREATED', 'Pickup pending at RedX hub'),
+            'pickup_pending': ('COURIER_CREATED', 'Pickup pending at RedX hub'),
+            'pickup-in-progress': ('COURIER_CREATED', 'RedX rider en route for pickup'),
+            'pickup requested': ('COURIER_CREATED', 'Pickup requested in RedX network'),
+            'picked-up': ('PICKED_UP', 'RedX rider picked up parcel from merchant'),
             'picked_up': ('PICKED_UP', 'RedX rider picked up parcel from merchant'),
+            'picked up': ('PICKED_UP', 'RedX rider picked up parcel from merchant'),
+            'pickup-completed': ('PICKED_UP', 'RedX rider picked up parcel from merchant'),
+            'pickup_completed': ('PICKED_UP', 'RedX rider picked up parcel from merchant'),
+            'received-at-hub': ('IN_TRANSIT', 'Parcel received at RedX hub'),
+            'agent-hold': ('IN_TRANSIT', 'Parcel temporarily held by RedX hub'),
+            'agent-area-change': ('IN_TRANSIT', 'Parcel re-routed in RedX delivery zone'),
+            'ready-for-delivery': ('IN_TRANSIT', 'Parcel ready for last mile delivery (RedX)'),
+            'in-transit': ('IN_TRANSIT', 'Parcel in RedX transit hub'),
+            'in_transit': ('IN_TRANSIT', 'Parcel in RedX transit hub'),
+            'in transit': ('IN_TRANSIT', 'Parcel in RedX transit hub'),
+            'delivery-in-progress': ('OUT_FOR_DELIVERY', 'RedX rider out for delivery to recipient'),
+            'out-for-delivery': ('OUT_FOR_DELIVERY', 'RedX rider out for delivery to recipient'),
             'out_for_delivery': ('OUT_FOR_DELIVERY', 'RedX rider out for delivery to recipient'),
+            'out for delivery': ('OUT_FOR_DELIVERY', 'RedX rider out for delivery to recipient'),
+            'delivered': ('DELIVERED', 'Parcel successfully delivered to recipient (RedX)'),
+            'cash-collected': ('DELIVERED', 'Parcel delivered and cash collected (RedX)'),
+            'agent-returning': ('RETURNED', 'Parcel returning to merchant (RedX)'),
+            'returned-to-merchant': ('RETURNED', 'Parcel returned to merchant (RedX)'),
             'returned_to_merchant': ('RETURNED', 'Parcel returned to merchant (RedX)'),
             'returned': ('RETURNED', 'Parcel returned to merchant (RedX)'),
+            'return': ('RETURNED', 'Parcel returned to merchant (RedX)'),
             'cancelled': ('CANCELLED', 'Parcel booking cancelled (RedX)'),
+            'pickup-cancelled': ('CANCELLED', 'Parcel pickup cancelled (RedX)'),
         }
-        order_status, notes = mapping.get(raw_status, ('IN_TRANSIT', f"RedX status updated: {raw_status}"))
+        order_status, notes = mapping.get(raw_status, ('IN_TRANSIT', f"RedX status updated: {raw_status.replace('_', ' ').replace('-', ' ').strip()}"))
         return {
             'orderStatus': order_status,
-            'collectedAmount': payload.get('amount_collected') or payload.get('collected_amount') or payload.get('cod_amount') or 0,
+            'collectedAmount': payload.get('amount_collected') or payload.get('collected_amount') or payload.get('cod_amount') or parcel.get('cash_collection_amount') or 0,
             'notes': notes,
         }
 
@@ -686,37 +902,68 @@ class ECourierAdapter(BaseCourierAdapter):
         api_key = (config.apiKey if config and config.apiKey else '') or os.getenv('ECOURIER_API_KEY', '')
         secret = (config.secret if config and config.secret else '') or os.getenv('ECOURIER_API_SECRET', '')
         user_id = str(extra.get('user_id') or os.getenv('ECOURIER_USER_ID', '')).strip()
-        package_code = str(extra.get('package_code') or os.getenv('ECOURIER_PACKAGE_CODE', 'PKG-01')).strip() or 'PKG-01'
+        package_code = str(extra.get('package_code') or os.getenv('ECOURIER_PACKAGE_CODE', '')).strip()
         return api_key.strip(), secret.strip(), user_id, package_code
 
+    def resolve_package_code(self, api_key, secret, user_id, configured_code):
+        if configured_code:
+            return configured_code
+        try:
+            resp = requests.post(
+                f"{self.BASE_URL}/packages",
+                headers={
+                    "API-KEY": api_key,
+                    "API-SECRET": secret,
+                    "USER-ID": user_id,
+                    "Content-Type": "application/json",
+                },
+                timeout=8,
+            )
+            if resp.status_code == 200 and resp.text:
+                data = resp.json()
+                pkgs = data if isinstance(data, list) else (data.get('data') or data.get('packages') or [])
+                if isinstance(pkgs, list) and len(pkgs) > 0:
+                    first = pkgs[0]
+                    if isinstance(first, dict):
+                        return str(first.get('package_code') or first.get('code') or first.get('id') or '').strip()
+        except Exception as e:
+            logger.warning(f"eCourier package lookup failed: {e}")
+        return ''
+
     def create_shipment(self, order, item_weight_kg=0.5, special_instruction=""):
+        config = self.get_provider_config()
+        sandbox_mode = self.is_sandbox_mode(config)
         api_key, secret, user_id, package_code = self.get_credentials()
         district = order.address.get('district', '') if isinstance(order.address, dict) else ''
         thana = order.address.get('thana', '') if isinstance(order.address, dict) else ''
         is_dhaka = str(district).strip().lower() == 'dhaka'
-        delivery_fee = 60 if is_dhaka else 130
+        delivery_fee = self.get_dynamic_fee(config, is_dhaka)
         cod_amount = order.total if order.paymentMethod == 'COD' else 0
 
         address_dict = order.address if isinstance(order.address, dict) else {}
         recipient_name = address_dict.get('customerName') or 'Valued Customer'
         raw_phone = address_dict.get('phone') or ''
         recipient_phone = normalize_bangladesh_phone(raw_phone)
-        full_address = address_dict.get('fullAddress') or f"{thana}, {district}"
+        full_address = address_dict.get('fullAddress') or f"{thana}, {district}".strip(', ')
         note = special_instruction or address_dict.get('orderNote') or 'Please call before delivery.'
 
-        is_mock_key = api_key in ['', 'ec_usr_849201'] or secret in ['', 'ec_key_192837']
+        has_live = self.has_live_credential(api_key) and self.has_live_credential(secret)
 
-        # If live credentials exist, execute real eCourier API call
-        if not is_mock_key:
+        if not sandbox_mode:
+            if not has_live:
+                raise ValueError("eCourier live API credentials are missing. Configure API Key, Secret & User ID or enable Sandbox Mode in Admin → Courier Hub.")
             if not user_id:
                 raise ValueError("eCourier requires User ID alongside API Key & API Secret in Courier Hub.")
+            resolved_pkg = self.resolve_package_code(api_key, secret, user_id, package_code)
+            if not resolved_pkg:
+                raise ValueError("eCourier Package Code is missing and could not be auto-fetched. Please set Package Code in Admin → Courier Hub.")
             payload = {
                 "recipient_name": recipient_name,
                 "recipient_mobile": recipient_phone,
                 "recipient_address": full_address,
-                "recipient_district": district or "Dhaka",
-                "recipient_thana": thana or "Mirpur",
-                "package_code": package_code,
+                "recipient_district": district,
+                "recipient_thana": thana or address_dict.get('area') or district,
+                "package_code": resolved_pkg,
                 "product_price": int(order.total),
                 "cash_collection_amount": int(cod_amount),
                 "invoice": str(order.id),
@@ -760,34 +1007,43 @@ class ECourierAdapter(BaseCourierAdapter):
                 logger.error(f"eCourier network error: {e}")
                 raise ConnectionError(f"eCourier connection failed: {str(e)}")
 
-        # Sandbox / Demonstration Fallback
+        # Sandbox Testing Fallback
         tracking_id = f"EC-{random.randint(1000000, 9999999)}"
         consignment_id = f"EC-CNG-{random.randint(10000, 99999)}"
-        rider_suffix = random.randint(100000, 999999)
 
         return {
             'provider': 'ecourier',
             'trackingId': tracking_id,
             'consignmentId': consignment_id,
-            'courierStatus': 'Manifested with eCourier (Sandbox/Demo)',
+            'courierStatus': 'Manifested with eCourier (Sandbox Testing)',
             'createdDate': timezone.localtime().strftime('%Y-%m-%d %I:%M %p'),
             'deliveryFee': delivery_fee,
             'codAmount': cod_amount,
             'trackingUrl': f"https://ecourier.com.bd/track/{tracking_id}",
             'hubLocation': 'Kakrail Delivery Office',
-            'assignedRiderName': 'eCourier Express Agent',
-            'assignedRiderPhone': f"01620{rider_suffix}",
+            'assignedRiderName': 'eCourier Express Agent (Sandbox)',
+            'assignedRiderPhone': '',
             'liveApi': False,
         }
 
     def get_balance(self):
+        config = self.get_provider_config()
+        sandbox_mode = self.is_sandbox_mode(config)
         api_key, secret, user_id, _ = self.get_credentials()
-        if not api_key or api_key == 'ec_usr_849201' or secret in ['', 'ec_key_192837']:
+        if sandbox_mode:
             return {
                 'success': True,
                 'isDemo': True,
-                'current_balance': 4150,
-                'message': 'Demo eCourier Balance (Configure API Key, Secret & User ID in settings)'
+                'sandboxMode': True,
+                'current_balance': 0,
+                'message': 'Sandbox Testing Mode Active — No live eCourier API call made.'
+            }
+        if not (self.has_live_credential(api_key) and self.has_live_credential(secret)):
+            return {
+                'success': False,
+                'isDemo': False,
+                'current_balance': 0,
+                'message': 'eCourier API credentials missing. Configure API Key, Secret & User ID (or enable Sandbox Mode).'
             }
         if not user_id:
             return {
@@ -823,9 +1079,13 @@ class ECourierAdapter(BaseCourierAdapter):
             return {'success': False, 'isDemo': False, 'message': str(e)}
 
     def check_status(self, tracking_code):
+        config = self.get_provider_config()
+        sandbox_mode = self.is_sandbox_mode(config)
         api_key, secret, user_id, _ = self.get_credentials()
-        if not api_key or api_key == 'ec_usr_849201' or secret in ['', 'ec_key_192837']:
+        if sandbox_mode:
             return {'status': 200, 'tracking_id': tracking_code, 'provider': 'ecourier', 'isDemo': True}
+        if not (self.has_live_credential(api_key) and self.has_live_credential(secret)):
+            return {'status': 400, 'isDemo': False, 'message': 'eCourier live API credentials not configured.'}
         try:
             resp = requests.post(
                 f"{self.BASE_URL}/parcel-tracking",
@@ -839,36 +1099,56 @@ class ECourierAdapter(BaseCourierAdapter):
                 timeout=10
             )
             data = resp.json() if resp.text else {}
+            q_data = data.get('query_data') if isinstance(data.get('query_data'), list) else []
+            latest_q = q_data[0] if (q_data and isinstance(q_data[0], dict)) else {}
             return {
                 'status': resp.status_code,
                 'provider': 'ecourier',
                 'tracking_id': tracking_code,
-                'parcel_status': data.get('status') or data.get('parcel_status') or '',
+                'parcel_status': data.get('status') or data.get('parcel_status') or latest_q.get('status') or '',
                 'raw': data,
             }
         except Exception as e:
             return {'status': 500, 'message': str(e)}
 
     def parse_webhook(self, payload):
+        q_data = payload.get('query_data') if isinstance(payload.get('query_data'), list) else []
+        latest_q = q_data[0] if (q_data and isinstance(q_data[0], dict)) else {}
         raw_status = str(
             payload.get('status')
             or payload.get('parcel_status')
             or payload.get('event')
+            or latest_q.get('status')
             or ''
         ).lower().strip()
         mapping = {
+            'order placed': ('COURIER_CREATED', 'Order placed at eCourier'),
+            'order_placed': ('COURIER_CREATED', 'Order placed at eCourier'),
+            'pending': ('COURIER_CREATED', 'Pending pickup at eCourier'),
+            'pickup requested': ('COURIER_CREATED', 'Pickup requested in eCourier portal'),
             'delivered': ('DELIVERED', 'Parcel successfully delivered via eCourier'),
+            'delivered_successfully': ('DELIVERED', 'Parcel successfully delivered via eCourier'),
             'picked_up': ('PICKED_UP', 'Rider picked up parcel from merchant (eCourier)'),
+            'picked-up': ('PICKED_UP', 'Rider picked up parcel from merchant (eCourier)'),
             'picked up': ('PICKED_UP', 'Rider picked up parcel from merchant (eCourier)'),
+            'parcel picked': ('PICKED_UP', 'Rider picked up parcel from merchant (eCourier)'),
             'in-transit': ('IN_TRANSIT', 'Parcel in destination transit hub (eCourier)'),
             'in_transit': ('IN_TRANSIT', 'Parcel in destination transit hub (eCourier)'),
+            'in transit': ('IN_TRANSIT', 'Parcel in destination transit hub (eCourier)'),
+            'arrived at hub': ('IN_TRANSIT', 'Parcel arrived at eCourier hub'),
+            'forwarded': ('IN_TRANSIT', 'Parcel forwarded to destination hub (eCourier)'),
+            'hold': ('IN_TRANSIT', 'Parcel held at eCourier hub'),
             'out for delivery': ('OUT_FOR_DELIVERY', 'eCourier rider out for delivery'),
+            'out-for-delivery': ('OUT_FOR_DELIVERY', 'eCourier rider out for delivery'),
             'out_for_delivery': ('OUT_FOR_DELIVERY', 'eCourier rider out for delivery'),
+            'assigned to rider': ('OUT_FOR_DELIVERY', 'Assigned to eCourier delivery rider'),
             'returned': ('RETURNED', 'Parcel returned to merchant (eCourier)'),
             'return': ('RETURNED', 'Parcel returned to merchant (eCourier)'),
+            'return to merchant': ('RETURNED', 'Parcel returned to merchant (eCourier)'),
             'cancelled': ('CANCELLED', 'Parcel booking cancelled (eCourier)'),
+            'canceled': ('CANCELLED', 'Parcel booking cancelled (eCourier)'),
         }
-        order_status, notes = mapping.get(raw_status, ('IN_TRANSIT', f"eCourier status updated: {raw_status}"))
+        order_status, notes = mapping.get(raw_status, ('IN_TRANSIT', f"eCourier status updated: {raw_status.replace('_', ' ').replace('-', ' ').strip()}"))
         return {
             'orderStatus': order_status,
             'collectedAmount': payload.get('collected_amount') or payload.get('payment_amount') or payload.get('cod_amount') or 0,
