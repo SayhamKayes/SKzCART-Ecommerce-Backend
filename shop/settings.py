@@ -13,9 +13,29 @@ sys.path.insert(0, str(BASE_DIR))
 load_dotenv(BASE_DIR.parent / '.env')
 load_dotenv(BASE_DIR / '.env')
 
-SECRET_KEY = os.getenv('DJANGO_SECRET_KEY', 'django-insecure-_#(9*cahwxq&v1r)c%-k4l*tyf8c*=r&ixm=11npg(%h=t34=8').strip().strip('\'"')
+from django.core.management.utils import get_random_secret_key
 
-DEBUG = os.getenv('DEBUG', 'True').lower() in ('true', '1', 't')
+
+def _resolve_secret_key(base_dir: Path) -> str:
+    env_key = os.getenv('DJANGO_SECRET_KEY', '').strip().strip('\'"')
+    if env_key:
+        return env_key
+    key_file = base_dir / '.runtime_secret_key'
+    try:
+        if key_file.exists():
+            stored = key_file.read_text(encoding='utf-8').strip()
+            if len(stored) >= 32:
+                return stored
+        generated = get_random_secret_key()
+        key_file.write_text(generated, encoding='utf-8')
+        return generated
+    except Exception:
+        return get_random_secret_key()
+
+
+SECRET_KEY = _resolve_secret_key(BASE_DIR)
+
+DEBUG = os.getenv('DEBUG', 'False').lower() in ('true', '1', 't')
 
 ALLOWED_HOSTS = [h.strip() for h in os.getenv('ALLOWED_HOSTS', '*').split(',') if h.strip()]
 
@@ -237,9 +257,9 @@ REST_FRAMEWORK = {
     ],
 }
 
-# SSLCOMMERZ Payment Gateway Configuration
-SSLCOMMERZ_STORE_ID = os.environ.get('SSLCOMMERZ_STORE_ID', 'testbox')
-SSLCOMMERZ_STORE_PASSWORD = os.environ.get('SSLCOMMERZ_STORE_PASSWORD', 'qwerty')
+# SSLCOMMERZ Payment Gateway Configuration (managed dynamically via Admin Payments & Gateways DB)
+SSLCOMMERZ_STORE_ID = os.environ.get('SSLCOMMERZ_STORE_ID', '')
+SSLCOMMERZ_STORE_PASSWORD = os.environ.get('SSLCOMMERZ_STORE_PASSWORD', '')
 SSLCOMMERZ_IS_SANDBOX = os.environ.get('SSLCOMMERZ_IS_SANDBOX', 'True').lower() in ('true', '1', 't')
 SSLCOMMERZ_FRONTEND_URL = os.environ.get('SSLCOMMERZ_FRONTEND_URL') or os.environ.get('APP_URL') or 'http://localhost:3001'
 SSLCOMMERZ_BACKEND_URL = os.environ.get('SSLCOMMERZ_BACKEND_URL', 'http://localhost:8000')
@@ -250,7 +270,7 @@ EMAIL_PORT = int(os.environ.get('EMAIL_PORT', 587))
 EMAIL_USE_TLS = os.environ.get('EMAIL_USE_TLS', 'True').lower() in ('true', '1', 't')
 EMAIL_HOST_USER = os.environ.get('EMAIL_HOST_USER', '')
 EMAIL_HOST_PASSWORD = os.environ.get('EMAIL_HOST_PASSWORD', '')
-DEFAULT_FROM_EMAIL = os.environ.get('DEFAULT_FROM_EMAIL', 'AmarDokan <orders@amardokan.com>')
+DEFAULT_FROM_EMAIL = os.environ.get('DEFAULT_FROM_EMAIL', EMAIL_HOST_USER or '')
 
 if EMAIL_HOST_USER and EMAIL_HOST_PASSWORD:
     EMAIL_BACKEND = 'django.core.mail.backends.smtp.EmailBackend'

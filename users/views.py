@@ -37,20 +37,69 @@ def user_login_or_register(request):
     district = str(data.get('district') or 'Dhaka').strip()
     thana = str(data.get('thana') or 'Mirpur').strip()
 
-    # Special handling for Demo User login
-    demo_phone = os.getenv('DEMO_USER_PHONE', '01712345678')
-    demo_pass = os.getenv('DEMO_USER_PASS', '1234')
-    if action == 'demo' or (clean_phone == demo_phone and action != 'register'):
+    # Dynamic Admin-controlled Demo Customer Login (disabled by default in production)
+    portal_access = {}
+    try:
+        from core.models import ShopSetting
+        s = ShopSetting.get_settings()
+        extra = s.extraConfig if isinstance(s.extraConfig, dict) else {}
+        if isinstance(extra.get('portalAccess'), dict):
+            portal_access = extra.get('portalAccess')
+    except Exception:
+        portal_access = {}
+
+    demo_enabled = bool(portal_access.get('demoCustomerEnabled', False))
+    demo_phone = normalize_phone(portal_access.get('demoCustomerPhone') or os.getenv('DEMO_USER_PHONE') or '')
+    demo_pass = str(portal_access.get('demoCustomerPassword') or os.getenv('DEMO_USER_PASS') or '').strip()
+
+    if action == 'demo':
+        if not demo_enabled or not demo_phone or not demo_pass:
+            return Response(
+                {'success': False, 'message': 'Demo customer login is currently disabled by administrator.'},
+                status=status.HTTP_403_FORBIDDEN
+            )
         demo_profile = CustomerProfile.objects.filter(phone=demo_phone).first()
         if not demo_profile:
             demo_profile = CustomerProfile.objects.create(
                 id=f'usr-demo-{demo_phone}',
                 name='Demo Customer',
                 phone=demo_phone,
-                email='demo@customer.com',
+                email=f"{demo_phone}@customer.amardokan.com",
                 district='Dhaka',
-                thana='Dhanmondi',
-                fullAddress='House 12, Road 4/A, Dhanmondi, Dhaka',
+                thana='Dhaka City',
+                fullAddress='Demo Account Address',
+                password=make_password(demo_pass),
+            )
+        return Response({
+            'success': True,
+            'message': 'Successfully logged in as Demo Customer!',
+            'user': {
+                'id': demo_profile.id,
+                'name': demo_profile.name,
+                'phone': demo_profile.phone,
+                'email': demo_profile.email,
+                'district': demo_profile.district,
+                'thana': demo_profile.thana,
+                'fullAddress': demo_profile.fullAddress,
+            }
+        })
+
+    if demo_enabled and demo_phone and demo_pass and clean_phone == demo_phone and action != 'register':
+        if password != demo_pass:
+            return Response(
+                {'success': False, 'message': 'Invalid password for demo customer account.'},
+                status=status.HTTP_401_UNAUTHORIZED
+            )
+        demo_profile = CustomerProfile.objects.filter(phone=demo_phone).first()
+        if not demo_profile:
+            demo_profile = CustomerProfile.objects.create(
+                id=f'usr-demo-{demo_phone}',
+                name='Demo Customer',
+                phone=demo_phone,
+                email=f"{demo_phone}@customer.amardokan.com",
+                district='Dhaka',
+                thana='Dhaka City',
+                fullAddress='Demo Account Address',
                 password=make_password(demo_pass),
             )
         return Response({

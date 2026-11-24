@@ -153,64 +153,68 @@ class Command(BaseCommand):
                 'name': 'Pathao Courier',
                 'logo': 'Pathao',
                 'isActive': True,
-                'apiKey': 'pk_live_pathao_merchant_92813',
-                'secret': 'ps_secret_key_847192738',
+                'apiKey': os.getenv('PATHAO_CLIENT_ID', ''),
+                'secret': os.getenv('PATHAO_CLIENT_SECRET', ''),
+                'extraCredentials': {'sandboxMode': False},
                 'coverage': '64 Districts (Full BD)',
                 'codFeePercent': 1.0,
                 'insideDhakaRate': 60,
                 'outsideDhakaRate': 130,
-                'lastSyncTime': '2026-09-22 10:45 AM',
-                'pendingCodAmount': 38450,
-                'settledCodAmount': 184500,
+                'lastSyncTime': 'Not synced yet',
+                'pendingCodAmount': 0,
+                'settledCodAmount': 0,
             },
             {
                 'id': 'steadfast',
                 'name': 'Steadfast Courier',
                 'logo': 'Steadfast',
                 'isActive': True,
-                'apiKey': os.getenv('STEADFAST_API_KEY', 'stf_live_api_88492010'),
-                'secret': os.getenv('STEADFAST_SECRET_KEY', 'stf_sec_019283849'),
+                'apiKey': os.getenv('STEADFAST_API_KEY', ''),
+                'secret': os.getenv('STEADFAST_SECRET_KEY', ''),
+                'extraCredentials': {'sandboxMode': False},
                 'coverage': 'Nationwide & Remote Upazila',
                 'codFeePercent': 1.0,
                 'insideDhakaRate': 60,
                 'outsideDhakaRate': 120,
-                'lastSyncTime': '2026-09-22 10:50 AM',
-                'pendingCodAmount': 54200,
-                'settledCodAmount': 249000,
+                'lastSyncTime': 'Not synced yet',
+                'pendingCodAmount': 0,
+                'settledCodAmount': 0,
             },
             {
                 'id': 'redx',
                 'name': 'RedX Logistics',
                 'logo': 'RedX',
                 'isActive': True,
-                'apiKey': os.getenv('REDX_API_TOKEN', 'redx_token_live_738192'),
-                'secret': os.getenv('REDX_SECRET_KEY', 'redx_hash_918237'),
+                'apiKey': os.getenv('REDX_API_TOKEN', ''),
+                'secret': os.getenv('REDX_SECRET_KEY', ''),
+                'extraCredentials': {'sandboxMode': False},
                 'coverage': 'All Metros & District Towns',
                 'codFeePercent': 1.0,
                 'insideDhakaRate': 65,
                 'outsideDhakaRate': 130,
-                'lastSyncTime': '2026-09-22 09:30 AM',
-                'pendingCodAmount': 16800,
-                'settledCodAmount': 92400,
+                'lastSyncTime': 'Not synced yet',
+                'pendingCodAmount': 0,
+                'settledCodAmount': 0,
             },
             {
                 'id': 'ecourier',
                 'name': 'eCourier Limited',
                 'logo': 'eCourier',
                 'isActive': False,
-                'apiKey': os.getenv('ECOURIER_API_KEY', 'ec_usr_849201'),
-                'secret': os.getenv('ECOURIER_SECRET_KEY', 'ec_key_192837'),
+                'apiKey': os.getenv('ECOURIER_API_KEY', ''),
+                'secret': os.getenv('ECOURIER_API_SECRET', ''),
+                'extraCredentials': {'sandboxMode': False},
                 'coverage': 'Nationwide Corporate Hubs',
                 'codFeePercent': 1.5,
                 'insideDhakaRate': 70,
                 'outsideDhakaRate': 140,
-                'lastSyncTime': '2026-09-21 06:15 PM',
+                'lastSyncTime': 'Not synced yet',
                 'pendingCodAmount': 0,
-                'settledCodAmount': 45000,
+                'settledCodAmount': 0,
             },
         ]
         for cr in couriers:
-            CourierConfig.objects.update_or_create(id=cr['id'], defaults=cr)
+            CourierConfig.objects.get_or_create(id=cr['id'], defaults=cr)
 
         self.stdout.write("Seeding Initial Order...")
         order_data = {
@@ -301,9 +305,13 @@ class Command(BaseCommand):
 
         self.stdout.write("Ensuring Django Admin Superuser exists...")
         admin_username = os.getenv('ADMIN_USER', 'admin')
-        admin_password = os.getenv('ADMIN_PASS', 'admin1234')
-        admin_email = os.getenv('ADMIN_EMAIL', 'admin@amardokan.com')
-        
+        admin_password = os.getenv('ADMIN_PASS', '').strip()
+        admin_email = os.getenv('ADMIN_EMAIL', '')
+
+        if not admin_password:
+            self.stdout.write(self.style.WARNING("ADMIN_PASS not set; skipping default superuser password initialization."))
+            return
+
         from django.contrib.auth import get_user_model
         User = get_user_model()
         

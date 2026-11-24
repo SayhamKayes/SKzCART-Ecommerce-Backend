@@ -1,3 +1,4 @@
+import secrets
 import uuid
 from django.utils import timezone
 from django.utils.text import slugify
@@ -475,7 +476,7 @@ def restore_recycle_bin_item(rb_item, actor='Admin', ip_address='127.0.0.1'):
             username=uname,
             phone=p.get('phone') or '',
             email=p.get('email') or '',
-            password=p.get('password') or '123456',
+            password=p.get('password') or secrets.token_urlsafe(12),
             role=p.get('role') or 'MANAGER',
             status=p.get('status') or 'ACTIVE',
             notes=p.get('notes') or '',
