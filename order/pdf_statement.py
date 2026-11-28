@@ -184,7 +184,7 @@ def generate_order_statement_pdf(
             if pay_st == "PAID" or st == "DELIVERED":
                 paid_revenue += net_amt
             else:
-                pending_cod_total += total_amt
+                pending_cod_total += net_amt
 
     # Table column definition (total width == 527.28)
     # X positions inside MARGIN_X (34) .. (561.28)
