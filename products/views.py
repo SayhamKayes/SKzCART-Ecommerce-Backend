@@ -65,9 +65,16 @@ def products_list_create(request):
         data = request.data.copy()
         if not data.get('id'):
             data['id'] = f"prod-{int(time.time() * 1000)}"
-        if not data.get('slug'):
-            base_slug = slugify(data.get('name', '')) or f"prod-{int(time.time())}"
-            data['slug'] = f"{base_slug}-{int(time.time() % 10000)}"
+        raw_slug = slugify(data.get('slug') or data.get('name', ''))
+        if not raw_slug:
+            raw_slug = f"prod-{int(time.time())}"
+        if Product.objects.filter(slug=raw_slug).exists():
+            raw_slug = f"{raw_slug}-{int(time.time() % 10000)}-{uuid.uuid4().hex[:4]}"
+        data['slug'] = raw_slug
+        if not str(data.get('sku') or '').strip():
+            data['sku'] = f"BD-{int(time.time() % 100000)}-{uuid.uuid4().hex[:4].upper()}"
+        if 'deliveryDays' not in data or data.get('deliveryDays') is None:
+            data['deliveryDays'] = ''
         if 'images' not in data and 'image' in data:
             data['images'] = [data['image']] if data['image'] else [DEFAULT_PRODUCT_IMAGE]
         elif 'images' not in data or not isinstance(data.get('images'), list) or len(data.get('images') or []) == 0:
@@ -143,6 +150,8 @@ def product_detail_update(request, pk):
 
     elif request.method in ['PUT', 'PATCH']:
         data = request.data.copy()
+        if 'deliveryDays' in data and data['deliveryDays'] is None:
+            data['deliveryDays'] = ''
         if 'images' not in data and 'image' in data:
             data['images'] = [data['image']] if data['image'] else [DEFAULT_PRODUCT_IMAGE]
         elif 'images' in data and (not isinstance(data.get('images'), list) or len(data.get('images') or []) == 0):
@@ -208,7 +217,6 @@ def product_detail_update(request, pk):
         rb = move_to_recycle_bin(**snap, deleted_by='Admin')
         try:
             from core.models import MarketingEvent
-            from django.db.models import Q
             MarketingEvent.objects.filter(Q(productId=prod_id) | Q(productName__iexact=prod_name)).delete()
         except Exception:
             pass

@@ -16,6 +16,9 @@ class ProductSerializer(serializers.ModelSerializer):
             'features', 'featuresBn', 'keyFeatures', 'variants', 'productType',
             'rating', 'reviewsCount', 'isHotDeal', 'badge', 'tag', 'warranty', 'deliveryDays', 'sortOrder'
         ]
+        extra_kwargs = {
+            'deliveryDays': {'required': False, 'allow_blank': True},
+        }
 
     def get_image(self, obj):
         if obj.images and isinstance(obj.images, list) and len(obj.images) > 0 and obj.images[0]:

@@ -26,7 +26,7 @@ class Product(models.Model):
     isHotDeal = models.BooleanField(default=False)
     badge = models.CharField(max_length=50, blank=True, default='')
     warranty = models.CharField(max_length=100, blank=True, default='')
-    deliveryDays = models.CharField(max_length=100, default='2-3 Days')
+    deliveryDays = models.CharField(max_length=100, default='2-3 Days', blank=True)
     sortOrder = models.IntegerField(default=0, db_index=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
