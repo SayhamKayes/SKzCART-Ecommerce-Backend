@@ -92,7 +92,7 @@ def _compute_order_attribution(camp: SaaSAdCampaign, orders_list: list):
             matched_orders.append(ord_obj)
 
     orders_count = len(matched_orders)
-    revenue_sum = float(sum(float(getattr(o, 'total', 0) or 0) for o in matched_orders))
+    revenue_sum = float(sum(max(0.0, float(getattr(o, 'total', 0) or 0) - float(getattr(o, 'deliveryFee', 0) or 0)) for o in matched_orders))
     spend_val = float(camp.spend or 0)
     roas_val = round(revenue_sum / spend_val, 2) if spend_val > 0 else 0.0
     return orders_count, revenue_sum, roas_val

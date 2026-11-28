@@ -641,7 +641,7 @@ def ga4_dashboard_view(request):
         if st == 'CANCELLED':
             continue
         order_purchase_count += 1
-        amt = float(o.total or 0)
+        amt = max(0.0, float(o.total or 0) - float(getattr(o, 'deliveryFee', 0) or 0))
         total_revenue += amt
 
         iso_d = _extract_iso_date(o.createdAt, getattr(o, 'created_at', None))

@@ -179,9 +179,10 @@ def generate_order_statement_pdf(
             active_count += 1
 
         if st not in CANCELLED_STATUSES:
-            valid_revenue += total_amt
+            net_amt = max(0, total_amt - fee_amt)
+            valid_revenue += net_amt
             if pay_st == "PAID" or st == "DELIVERED":
-                paid_revenue += total_amt
+                paid_revenue += net_amt
             else:
                 pending_cod_total += total_amt
 
